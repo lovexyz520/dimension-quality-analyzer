@@ -10,6 +10,9 @@ os.environ["KALEIDO_DISABLE_SANDBOX"] = "1"
 import numpy as np
 import plotly.io as pio
 
+# 中文字體設定（Noto Sans CJK 在 Linux 上可用）
+CJK_FONT = "Noto Sans CJK TC, Noto Sans TC, Microsoft JhengHei, PingFang TC, sans-serif"
+
 # 修復 Streamlit Cloud 上 kaleido 無法存取 /dev/shm 的問題
 try:
     pio.kaleido.scope.chromium_args = tuple(
@@ -198,7 +201,7 @@ def _add_spec_lines(fig, nominal: float, upper: float, lower: float) -> None:
             yref="y",
             text=f"上限 {upper:.4f}",
             showarrow=False,
-            font=dict(color="red", size=12),
+            font=dict(family=CJK_FONT, color="red", size=12),
             xanchor="left",
         )
     if pd.notna(nominal):
@@ -210,7 +213,7 @@ def _add_spec_lines(fig, nominal: float, upper: float, lower: float) -> None:
             yref="y",
             text=f"中值 {nominal:.4f}",
             showarrow=False,
-            font=dict(color="red", size=12),
+            font=dict(family=CJK_FONT, color="red", size=12),
             xanchor="left",
         )
     if pd.notna(lower):
@@ -222,7 +225,7 @@ def _add_spec_lines(fig, nominal: float, upper: float, lower: float) -> None:
             yref="y",
             text=f"下限 {lower:.4f}",
             showarrow=False,
-            font=dict(color="red", size=12),
+            font=dict(family=CJK_FONT, color="red", size=12),
             xanchor="left",
         )
 
@@ -243,6 +246,7 @@ def _build_fig(sub: pd.DataFrame, dim: str, height: int) -> go.Figure:
         showlegend=False,
         height=height,
         margin=dict(l=60, r=140, t=60, b=50),
+        font=dict(family=CJK_FONT),
     )
     return fig
 
@@ -279,7 +283,7 @@ def _add_spec_edge_markers(
             yref="y",
             text=f"上限 {upper:.4f} (超出視窗)",
             showarrow=False,
-            font=dict(color="red", size=12),
+            font=dict(family=CJK_FONT, color="red", size=12),
             xanchor="left",
         )
     if pd.notna(lower) and pd.notna(y_min) and lower < y_min:
@@ -290,7 +294,7 @@ def _add_spec_edge_markers(
             yref="y",
             text=f"下限 {lower:.4f} (超出視窗)",
             showarrow=False,
-            font=dict(color="red", size=12),
+            font=dict(family=CJK_FONT, color="red", size=12),
             xanchor="left",
         )
 
