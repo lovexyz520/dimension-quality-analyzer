@@ -1,7 +1,11 @@
 ﻿import base64
 import io
+import os
 import zipfile
 from typing import Optional, Tuple
+
+# Kaleido 在 Cloud 環境需要關閉 sandbox 模式
+os.environ["KALEIDO_DISABLE_SANDBOX"] = "1"
 
 import numpy as np
 import pandas as pd
