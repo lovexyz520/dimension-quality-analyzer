@@ -59,5 +59,8 @@ Thumbs.db
 *.log
 nul
 
+# Test/debug images
+/*.png
+
 # Streamlit
 .streamlit/secrets.toml
