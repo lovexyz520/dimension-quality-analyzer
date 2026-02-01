@@ -8,6 +8,15 @@ from typing import Optional, Tuple
 os.environ["KALEIDO_DISABLE_SANDBOX"] = "1"
 
 import numpy as np
+import plotly.io as pio
+
+# 修復 Streamlit Cloud 上 kaleido 無法存取 /dev/shm 的問題
+try:
+    pio.kaleido.scope.chromium_args = tuple(
+        [arg for arg in pio.kaleido.scope.chromium_args if arg != "--disable-dev-shm-usage"]
+    )
+except Exception:
+    pass
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
