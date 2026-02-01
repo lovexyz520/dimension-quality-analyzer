@@ -2,7 +2,7 @@
 
 製造業尺寸品質分析工具 - 基於盒鬚圖的量測數據可視化與統計分析平台
 
-[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://streamlit.io/)
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://dimension-quality-analyzer-rib2iuacnie46eat67mwfr.streamlit.app/)
 
 ## 功能特色
 
@@ -20,13 +20,13 @@
 
 ### 線上使用
 
-直接訪問 Streamlit Cloud 部署版本（部署後更新連結）
+👉 **[立即使用 Dimension Quality Analyzer](https://dimension-quality-analyzer-rib2iuacnie46eat67mwfr.streamlit.app/)**
 
 ### 本地安裝
 
 ```bash
 # 克隆專案
-git clone https://github.com/YOUR_USERNAME/dimension-quality-analyzer.git
+git clone https://github.com/lovexyz520/dimension-quality-analyzer.git
 cd dimension-quality-analyzer
 
 # 建立虛擬環境
