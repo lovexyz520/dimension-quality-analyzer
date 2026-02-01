@@ -1,0 +1,12 @@
+﻿[project]
+name = "box-and-whisker-plot"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "streamlit>=1.32",
+  "pandas>=2.0",
+  "openpyxl>=3.1",
+  "plotly>=5.18",
+  "numpy>=1.24",
+  "kaleido>=0.2.1",
+]

@@ -1,0 +1,97 @@
+# Dimension Quality Analyzer
+
+製造業尺寸品質分析工具 - 基於盒鬚圖的量測數據可視化與統計分析平台
+
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://streamlit.io/)
+
+## 功能特色
+
+- **Excel 自動解析** - 自動識別「重點尺寸」工作表，智能定位標題列與數據欄位
+- **盒鬚圖可視化** - 使用 Plotly 繪製互動式盒鬚圖，直觀呈現數據分佈
+- **規格線標示** - 自動顯示上限、下限、中值規格線
+- **超規格標記** - 紅色標記超出規格的量測點
+- **統計分析** - 計算 Count、Mean、Std、Min、Median、Max
+- **製程能力指標** - 計算 Cp、Cpk 評估製程穩定性
+- **SPC 控制圖** - I-MR 控制圖分析與管制界限計算
+- **多檔案支援** - 可合併或分檔比較多個 Excel 檔案
+- **多格式匯出** - 支援 PNG、Excel、HTML、ZIP 等格式
+
+## 快速開始
+
+### 線上使用
+
+直接訪問 Streamlit Cloud 部署版本（部署後更新連結）
+
+### 本地安裝
+
+```bash
+# 克隆專案
+git clone https://github.com/YOUR_USERNAME/dimension-quality-analyzer.git
+cd dimension-quality-analyzer
+
+# 建立虛擬環境
+python -m venv .venv
+
+# 啟動虛擬環境
+# Windows
+.venv\Scripts\activate
+# macOS/Linux
+source .venv/bin/activate
+
+# 安裝依賴
+pip install -r requirements.txt
+
+# 執行應用程式
+streamlit run streamlit_app.py
+```
+
+## Excel 檔案格式要求
+
+應用程式會自動偵測包含「重點尺寸」的工作表，或尋找含有「規格」與「球標」欄位的工作表。
+
+### 必要欄位
+
+| 欄位名稱 | 說明 |
+|---------|------|
+| 規格 | 標稱值 (Nominal) |
+| 正公差 | 上公差值 |
+| 負公差 | 下公差值 |
+| 球標 | 尺寸標識/編號 |
+| 量測值欄位 | 位於球標之後，量測方式之前 |
+| 量測方式 | (選填) 量測方法說明 |
+
+### 範本檔案
+
+請參考 `sample_data/template.xlsx` 了解正確的檔案格式。
+
+## 使用流程
+
+1. **上傳檔案** - 拖放或選擇 `.xlsm` / `.xlsx` 檔案
+2. **選擇模式** - 合併多檔或分檔比較
+3. **調整參數** - 圖表高度、視圖模式、縮放設定
+4. **搜尋維度** - 使用關鍵字篩選特定尺寸
+5. **查看分析** - 瀏覽盒鬚圖與統計數據
+6. **匯出結果** - 下載 PNG、Excel 或 HTML 報表
+
+## 技術架構
+
+| 元件 | 技術 |
+|------|------|
+| Web 框架 | Streamlit |
+| 數據處理 | Pandas, NumPy |
+| 視覺化 | Plotly |
+| Excel 讀寫 | openpyxl |
+| 圖片匯出 | Kaleido |
+
+## 匯出選項
+
+- **CSV 長表** - 整理後的量測數據
+- **Excel 統計摘要** - 各維度統計資訊
+- **CP/CPK + SPC 報表** - 製程能力與控制圖分析
+- **PNG 圖表** - 高解析度盒鬚圖
+- **HTML 報表** - 包含圖表的完整報告
+- **ZIP 打包** - 批次下載所有圖表
+
+## 授權
+
+本專案採用 MIT 授權條款 - 詳見 [LICENSE](LICENSE) 檔案
