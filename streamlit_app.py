@@ -68,6 +68,37 @@ def _detect_focus_sheet(xl: pd.ExcelFile) -> Tuple[Optional[str], Optional[str]]
     return None, "找不到包含 '規格' 與 '球標' 的工作表"
 
 
+def _extract_mold_and_pos(
+    df: pd.DataFrame, header_row: int, meas_cols: list
+) -> Tuple[dict, dict, dict]:
+    header = df.iloc[header_row]
+    # Mold labels are in the header row; forward-fill across measurement columns.
+    mold_labels = {}
+    current_label = ""
+    for col in meas_cols:
+        label = _clean_cell(header.iloc[col])
+        if label:
+            current_label = label
+        mold_labels[col] = current_label
+
+    # Position row is usually the next row under the header.
+    pos_row = df.iloc[header_row + 1] if header_row + 1 < len(df) else None
+    pos_raw = {}
+    pos_in_mold = {}
+    mold_counts = {}
+    for col in meas_cols:
+        raw_val = np.nan
+        if pos_row is not None:
+            raw_val = pd.to_numeric(pos_row.iloc[col], errors="coerce")
+        pos_raw[col] = raw_val
+
+        mold = mold_labels.get(col, "")
+        mold_counts[mold] = mold_counts.get(mold, 0) + 1
+        pos_in_mold[col] = mold_counts[mold]
+
+    return mold_labels, pos_raw, pos_in_mold
+
+
 def parse_focus_dimensions(df: pd.DataFrame) -> pd.DataFrame:
     header_row = _find_header_row(df)
     if header_row is None:
@@ -90,6 +121,8 @@ def parse_focus_dimensions(df: pd.DataFrame) -> pd.DataFrame:
     meas_cols = [i for i in range(col_label + 1, col_method) if i < df.shape[1]]
     if not meas_cols:
         raise ValueError("找不到量測數值欄位")
+
+    mold_labels, pos_raw, pos_in_mold = _extract_mold_and_pos(df, header_row, meas_cols)
 
     data = df.iloc[header_row + 2 :].copy()
 
@@ -142,7 +175,9 @@ def parse_focus_dimensions(df: pd.DataFrame) -> pd.DataFrame:
         lower = nominal + minus_num.loc[idx] if pd.notna(nominal) and pd.notna(minus_num.loc[idx]) else np.nan
 
         values = pd.to_numeric(meas.loc[idx], errors="coerce").dropna().tolist()
-        for v in values:
+        for col, v in zip(meas_cols, pd.to_numeric(meas.loc[idx], errors="coerce").tolist()):
+            if pd.isna(v):
+                continue
             rows.append(
                 {
                     "dimension": dim_label,
@@ -150,6 +185,9 @@ def parse_focus_dimensions(df: pd.DataFrame) -> pd.DataFrame:
                     "nominal": float(nominal) if pd.notna(nominal) else np.nan,
                     "upper": float(upper) if pd.notna(upper) else np.nan,
                     "lower": float(lower) if pd.notna(lower) else np.nan,
+                    "mold": mold_labels.get(col, ""),
+                    "pos_raw": float(pos_raw.get(col)) if pd.notna(pos_raw.get(col, np.nan)) else np.nan,
+                    "pos_in_mold": float(pos_in_mold.get(col)) if pd.notna(pos_in_mold.get(col, np.nan)) else np.nan,
                 }
             )
 
@@ -512,7 +550,7 @@ img {{ margin-bottom: 24px; }}
 
 
 st.title("盒鬚圖分析工具")
-st.caption("上傳單一或多個 Excel，支援合併或分檔比較，每個維度一張圖。")
+st.caption("上傳單一或多個 Excel，支援自動分組或全部合併，每個維度一張圖。")
 
 uploaded_files = st.file_uploader(
     "上傳 Excel 檔案 (xlsm/xlsx)",
@@ -524,7 +562,6 @@ if not uploaded_files:
     st.info("請先上傳 Excel 檔案")
     st.stop()
 
-combine_files = st.checkbox("合併多檔成單一分佈", value=True)
 chart_height = st.slider("圖表高度", min_value=360, max_value=900, value=520, step=20)
 focus_on_data = st.checkbox("放大顯示盒鬚圖（以數據為主）", value=True)
 dual_view = st.checkbox("雙圖模式（完整規格 + 放大視圖）", value=False)
@@ -551,10 +588,44 @@ if not all_frames:
 
 raw = pd.concat(all_frames, ignore_index=True)
 
-if combine_files:
+mode = st.radio(
+    "顯示模式",
+    options=["自動分組", "強制分檔顯示", "全部合併成一張圖"],
+    index=0,
+    horizontal=True,
+)
+
+file_list = sorted(raw["file"].dropna().unique().tolist())
+file_mold_counts = {}
+for fname in file_list:
+    sub = raw[raw["file"] == fname]
+    molds = [m for m in sub.get("mold", pd.Series(dtype=str)).dropna().unique() if str(m).strip()]
+    file_mold_counts[fname] = len(molds)
+
+
+def _format_pos(x) -> str:
+    if pd.isna(x):
+        return "P?"
+    return f"P{int(float(x))}"
+
+
+if mode == "全部合併成一張圖":
     raw["group"] = "合併"
 else:
-    raw["group"] = raw["file"]
+    def _group_for_row(row) -> str:
+        fname = row.get("file")
+        multi_mold = file_mold_counts.get(fname, 0) >= 2
+        if mode == "強制分檔顯示":
+            if multi_mold:
+                return f"{fname} {_format_pos(row.get('pos_in_mold'))}"
+            return f"{fname} 合併"
+        if multi_mold:
+            return _format_pos(row.get("pos_in_mold"))
+        if len(file_list) <= 1:
+            return "合併"
+        return f"{fname} 合併"
+
+    raw["group"] = raw.apply(_group_for_row, axis=1)
 
 all_dimensions = sorted(raw["dimension"].dropna().unique().tolist())
 
