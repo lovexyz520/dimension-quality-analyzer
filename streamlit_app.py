@@ -1,553 +1,52 @@
-﻿import base64
+"""Dimension Quality Analyzer - Streamlit Web Application."""
+
+import base64
 import io
 import os
 import zipfile
-from typing import Optional, Tuple
 
-# Kaleido 在 Cloud 環境需要關閉 sandbox 模式
+# Kaleido needs sandbox disabled on Cloud environment
 os.environ["KALEIDO_DISABLE_SANDBOX"] = "1"
 
-import numpy as np
+import pandas as pd
 import plotly.io as pio
+import streamlit as st
 
-# 中文字體設定（Noto Sans CJK 在 Linux 上可用）
-CJK_FONT = "Noto Sans CJK TC, Noto Sans TC, Microsoft JhengHei, PingFang TC, sans-serif"
-
-# 修復 Streamlit Cloud 上 kaleido 無法存取 /dev/shm 的問題
+# Fix kaleido /dev/shm access issue on Streamlit Cloud
 try:
     pio.kaleido.scope.chromium_args = tuple(
         [arg for arg in pio.kaleido.scope.chromium_args if arg != "--disable-dev-shm-usage"]
     )
 except Exception:
     pass
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import streamlit as st
+
+from core import (
+    load_excel,
+    pick_spec_values,
+    stats_table,
+    cpk_with_rating,
+    imr_spc_points,
+    calculate_normalized_deviation,
+    add_spec_lines,
+    build_fig,
+    apply_y_range,
+    add_spec_edge_markers,
+    add_out_of_spec_points,
+    build_cpk_heatmap,
+    build_normalized_deviation_chart,
+    build_position_comparison_chart,
+    build_imr_chart,
+    download_plot_button,
+    download_excel_button,
+    download_stats_excel,
+    download_quality_reports,
+    build_report_html,
+    download_pdf_report_button,
+    assign_groups_vectorized,
+)
 
 
 st.set_page_config(page_title="Box-and-Whisker Plot", layout="wide")
-
-
-def _find_header_row(df: pd.DataFrame) -> Optional[int]:
-    for i in range(len(df)):
-        row = df.iloc[i].astype(str)
-        if row.str.contains("規格", na=False).any() and row.str.contains("球標", na=False).any():
-            return i
-    return None
-
-
-def _find_col_index(header_row: pd.Series, label: str) -> Optional[int]:
-    for idx, val in header_row.items():
-        if str(val).strip() == label:
-            return idx
-    return None
-
-
-def _clean_cell(value) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, float) and np.isnan(value):
-        return ""
-    return str(value).strip()
-
-
-def _detect_focus_sheet(xl: pd.ExcelFile) -> Tuple[Optional[str], Optional[str]]:
-    for name in xl.sheet_names:
-        if "重點尺寸" in str(name):
-            return name, None
-
-    for name in xl.sheet_names:
-        try:
-            df = pd.read_excel(xl, sheet_name=name, header=None, engine="openpyxl")
-        except Exception:
-            continue
-        if _find_header_row(df) is not None:
-            return name, None
-
-    return None, "找不到包含 '規格' 與 '球標' 的工作表"
-
-
-def _extract_mold_and_pos(
-    df: pd.DataFrame, header_row: int, meas_cols: list
-) -> Tuple[dict, dict, dict]:
-    header = df.iloc[header_row]
-    # Mold labels are in the header row; forward-fill across measurement columns.
-    mold_labels = {}
-    current_label = ""
-    for col in meas_cols:
-        label = _clean_cell(header.iloc[col])
-        if label:
-            current_label = label
-        mold_labels[col] = current_label
-
-    # Position row is usually the next row under the header.
-    pos_row = df.iloc[header_row + 1] if header_row + 1 < len(df) else None
-    pos_raw = {}
-    pos_in_mold = {}
-    mold_counts = {}
-    for col in meas_cols:
-        raw_val = np.nan
-        if pos_row is not None:
-            raw_val = pd.to_numeric(pos_row.iloc[col], errors="coerce")
-        pos_raw[col] = raw_val
-
-        mold = mold_labels.get(col, "")
-        mold_counts[mold] = mold_counts.get(mold, 0) + 1
-        pos_in_mold[col] = mold_counts[mold]
-
-    return mold_labels, pos_raw, pos_in_mold
-
-
-def parse_focus_dimensions(df: pd.DataFrame) -> pd.DataFrame:
-    header_row = _find_header_row(df)
-    if header_row is None:
-        raise ValueError("找不到包含 '規格' 與 '球標' 的標題列")
-
-    header = df.iloc[header_row]
-
-    col_spec = _find_col_index(header, "規格")
-    col_plus = _find_col_index(header, "正公差")
-    col_minus = _find_col_index(header, "負公差")
-    col_label = _find_col_index(header, "球標")
-    col_method = _find_col_index(header, "量測方式")
-
-    if col_label is None:
-        raise ValueError("找不到 '球標' 欄位")
-
-    if col_method is None:
-        col_method = df.shape[1]
-
-    meas_cols = [i for i in range(col_label + 1, col_method) if i < df.shape[1]]
-    if not meas_cols:
-        raise ValueError("找不到量測數值欄位")
-
-    mold_labels, pos_raw, pos_in_mold = _extract_mold_and_pos(df, header_row, meas_cols)
-
-    data = df.iloc[header_row + 2 :].copy()
-
-    meas = data.iloc[:, meas_cols].apply(pd.to_numeric, errors="coerce")
-    spec_num = (
-        pd.to_numeric(data.iloc[:, col_spec], errors="coerce")
-        if col_spec is not None
-        else pd.Series([np.nan] * len(data), index=data.index)
-    )
-    plus_num = (
-        pd.to_numeric(data.iloc[:, col_plus], errors="coerce")
-        if col_plus is not None
-        else pd.Series([np.nan] * len(data), index=data.index)
-    )
-    minus_num = (
-        pd.to_numeric(data.iloc[:, col_minus], errors="coerce")
-        if col_minus is not None
-        else pd.Series([np.nan] * len(data), index=data.index)
-    )
-    label_series = data.iloc[:, col_label]
-    col0 = data.iloc[:, 0] if df.shape[1] > 0 else pd.Series([None] * len(data), index=data.index)
-
-    keep = meas.notna().any(axis=1) | spec_num.notna() | label_series.notna() | col0.notna()
-    data = data.loc[keep]
-    meas = meas.loc[data.index]
-    label_series = label_series.loc[data.index]
-    col0 = col0.loc[data.index]
-    spec_num = spec_num.loc[data.index]
-    plus_num = plus_num.loc[data.index]
-    minus_num = minus_num.loc[data.index]
-
-    rows = []
-    for idx in data.index:
-        base = _clean_cell(label_series.loc[idx])
-        prefix = _clean_cell(col0.loc[idx])
-        if prefix and base:
-            dim_label = f"{prefix} {base}"
-        elif base:
-            dim_label = base
-        elif prefix:
-            dim_label = prefix
-        else:
-            dim_label = ""
-
-        if not dim_label:
-            continue
-
-        nominal = spec_num.loc[idx]
-        upper = nominal + plus_num.loc[idx] if pd.notna(nominal) and pd.notna(plus_num.loc[idx]) else np.nan
-        lower = nominal + minus_num.loc[idx] if pd.notna(nominal) and pd.notna(minus_num.loc[idx]) else np.nan
-
-        values = pd.to_numeric(meas.loc[idx], errors="coerce").dropna().tolist()
-        for col, v in zip(meas_cols, pd.to_numeric(meas.loc[idx], errors="coerce").tolist()):
-            if pd.isna(v):
-                continue
-            rows.append(
-                {
-                    "dimension": dim_label,
-                    "value": float(v),
-                    "nominal": float(nominal) if pd.notna(nominal) else np.nan,
-                    "upper": float(upper) if pd.notna(upper) else np.nan,
-                    "lower": float(lower) if pd.notna(lower) else np.nan,
-                    "mold": mold_labels.get(col, ""),
-                    "pos_raw": float(pos_raw.get(col)) if pd.notna(pos_raw.get(col, np.nan)) else np.nan,
-                    "pos_in_mold": float(pos_in_mold.get(col)) if pd.notna(pos_in_mold.get(col, np.nan)) else np.nan,
-                }
-            )
-
-    return pd.DataFrame(rows)
-
-
-def load_excel(uploaded_file) -> Tuple[pd.DataFrame, Optional[str]]:
-    try:
-        xl = pd.ExcelFile(uploaded_file)
-        sheet_name, err = _detect_focus_sheet(xl)
-        if err:
-            return pd.DataFrame(), err
-        df = pd.read_excel(xl, sheet_name=sheet_name, header=None, engine="openpyxl")
-        out = parse_focus_dimensions(df)
-        if out.empty:
-            return out, "沒有解析到任何量測數值"
-        return out, None
-    except Exception as exc:
-        return pd.DataFrame(), str(exc)
-
-
-def _calc_out_of_spec(values: pd.Series, lower: float, upper: float) -> pd.Series:
-    if pd.isna(lower) or pd.isna(upper):
-        return pd.Series([False] * len(values), index=values.index)
-    return (values < lower) | (values > upper)
-
-
-def _pick_spec_values(sub: pd.DataFrame) -> Tuple[float, float, float, int]:
-    nominal_list = sub["nominal"].dropna().unique().tolist()
-    upper_list = sub["upper"].dropna().unique().tolist()
-    lower_list = sub["lower"].dropna().unique().tolist()
-
-    nominal = nominal_list[0] if nominal_list else np.nan
-    upper = upper_list[0] if upper_list else np.nan
-    lower = lower_list[0] if lower_list else np.nan
-
-    spec_versions = max(len(nominal_list), len(upper_list), len(lower_list))
-    return float(nominal) if pd.notna(nominal) else np.nan, float(upper) if pd.notna(upper) else np.nan, float(lower) if pd.notna(lower) else np.nan, spec_versions
-
-
-def _add_spec_lines(fig, nominal: float, upper: float, lower: float) -> None:
-    ann_x = 1.02
-    if pd.notna(upper):
-        fig.add_hline(y=upper, line_color="red", line_width=2)
-        fig.add_annotation(
-            x=ann_x,
-            xref="paper",
-            y=upper,
-            yref="y",
-            text=f"上限 {upper:.4f}",
-            showarrow=False,
-            font=dict(family=CJK_FONT, color="red", size=12),
-            xanchor="left",
-        )
-    if pd.notna(nominal):
-        fig.add_hline(y=nominal, line_color="red", line_width=1, line_dash="dot")
-        fig.add_annotation(
-            x=ann_x,
-            xref="paper",
-            y=nominal,
-            yref="y",
-            text=f"中值 {nominal:.4f}",
-            showarrow=False,
-            font=dict(family=CJK_FONT, color="red", size=12),
-            xanchor="left",
-        )
-    if pd.notna(lower):
-        fig.add_hline(y=lower, line_color="red", line_width=2)
-        fig.add_annotation(
-            x=ann_x,
-            xref="paper",
-            y=lower,
-            yref="y",
-            text=f"下限 {lower:.4f}",
-            showarrow=False,
-            font=dict(family=CJK_FONT, color="red", size=12),
-            xanchor="left",
-        )
-
-
-def _build_fig(sub: pd.DataFrame, dim: str, height: int) -> go.Figure:
-    fig = px.box(
-        sub,
-        x="group",
-        y="value",
-        color="group",
-        points="all",
-    )
-    fig.update_traces(jitter=0.2, pointpos=0, marker=dict(size=7, opacity=0.85))
-    fig.update_layout(
-        title=dim,
-        xaxis_title=None,
-        yaxis_title="量測值",
-        showlegend=False,
-        height=height,
-        margin=dict(l=60, r=140, t=60, b=50),
-        font=dict(family=CJK_FONT),
-    )
-    return fig
-
-
-def _apply_y_range(
-    fig, sub: pd.DataFrame, lower: float, upper: float, focus_on_data: bool
-) -> Tuple[float, float]:
-    data_min = sub["value"].min()
-    data_max = sub["value"].max()
-    if focus_on_data:
-        candidates = [v for v in [data_min, data_max] if pd.notna(v)]
-    else:
-        candidates = [v for v in [data_min, data_max, lower, upper] if pd.notna(v)]
-    if not candidates:
-        return np.nan, np.nan
-    y_min = min(candidates)
-    y_max = max(candidates)
-    span = y_max - y_min
-    pad = span * 0.15 if span > 0 else (abs(y_max) * 0.02 + 0.02)
-    y_min -= pad
-    y_max += pad
-    fig.update_yaxes(range=[y_min, y_max])
-    return y_min, y_max
-
-
-def _add_spec_edge_markers(
-    fig, lower: float, upper: float, y_min: float, y_max: float
-) -> None:
-    if pd.notna(upper) and pd.notna(y_max) and upper > y_max:
-        fig.add_annotation(
-            x=1.02,
-            xref="paper",
-            y=y_max,
-            yref="y",
-            text=f"上限 {upper:.4f} (超出視窗)",
-            showarrow=False,
-            font=dict(family=CJK_FONT, color="red", size=12),
-            xanchor="left",
-        )
-    if pd.notna(lower) and pd.notna(y_min) and lower < y_min:
-        fig.add_annotation(
-            x=1.02,
-            xref="paper",
-            y=y_min,
-            yref="y",
-            text=f"下限 {lower:.4f} (超出視窗)",
-            showarrow=False,
-            font=dict(family=CJK_FONT, color="red", size=12),
-            xanchor="left",
-        )
-
-
-def _add_out_of_spec_points(fig, sub: pd.DataFrame, lower: float, upper: float) -> None:
-    mask = _calc_out_of_spec(sub["value"], lower, upper)
-    if not mask.any():
-        return
-    out = sub.loc[mask]
-    fig.add_trace(
-        go.Scatter(
-            x=out["group"],
-            y=out["value"],
-            mode="markers",
-            marker=dict(color="red", size=7, symbol="circle-open"),
-            showlegend=False,
-        )
-    )
-
-
-def _download_plot_button(fig, filename: str) -> None:
-    try:
-        img_bytes = fig.to_image(format="png", scale=3)
-    except Exception:
-        img_bytes = None
-
-    if img_bytes:
-        st.download_button(
-            "下載圖表 (PNG)",
-            data=img_bytes,
-            file_name=filename,
-            mime="image/png",
-        )
-    else:
-        st.caption("PNG 下載需要 kaleido，請確認已安裝")
-
-
-def _download_excel_button(df: pd.DataFrame, filename: str) -> None:
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="data")
-    st.download_button(
-        "下載資料 (Excel)",
-        data=buffer.getvalue(),
-        file_name=filename,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-
-def _stats_table(df: pd.DataFrame) -> pd.DataFrame:
-    def _agg(group):
-        values = group["value"].astype(float)
-        nominal, upper, lower, spec_versions = _pick_spec_values(group)
-        out_mask = _calc_out_of_spec(values, lower, upper)
-        return pd.Series(
-            {
-                "count": values.count(),
-                "mean": values.mean(),
-                "std": values.std(ddof=1),
-                "min": values.min(),
-                "median": values.median(),
-                "max": values.max(),
-                "nominal": nominal,
-                "upper": upper,
-                "lower": lower,
-                "out_of_spec": int(out_mask.sum()),
-                "spec_versions": spec_versions,
-            }
-        )
-
-    return df.groupby("dimension", as_index=False).apply(_agg).reset_index(drop=True)
-
-
-def _download_stats_excel(stats: pd.DataFrame, filename: str) -> None:
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        stats.to_excel(writer, index=False, sheet_name="summary")
-    st.download_button(
-        "下載統計摘要 (Excel)",
-        data=buffer.getvalue(),
-        file_name=filename,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-
-def _cp_cpk_summary(df: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for dim, group in df.groupby("dimension"):
-        values = group["value"].astype(float)
-        nominal, upper, lower, _ = _pick_spec_values(group)
-        mean = values.mean()
-        std = values.std(ddof=1)
-        if pd.notna(upper) and pd.notna(lower) and std and std > 0:
-            cp = (upper - lower) / (6 * std)
-            cpu = (upper - mean) / (3 * std)
-            cpl = (mean - lower) / (3 * std)
-            cpk = min(cpu, cpl)
-        else:
-            cp = np.nan
-            cpk = np.nan
-        rows.append(
-            {
-                "dimension": dim,
-                "count": values.count(),
-                "mean": mean,
-                "std": std,
-                "USL": upper,
-                "LSL": lower,
-                "Cp": cp,
-                "Cpk": cpk,
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def _imr_spc_points(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    rows = []
-    summary_rows = []
-    d2 = 1.128
-    d3 = 0
-    d4 = 3.267
-
-    for dim, group in df.groupby("dimension"):
-        values = group["value"].astype(float).reset_index(drop=True)
-        if values.empty:
-            continue
-        mr = values.diff().abs()
-        mr_bar = mr[1:].mean()
-        sigma = mr_bar / d2 if mr_bar and mr_bar > 0 else np.nan
-        x_bar = values.mean()
-
-        x_ucl = x_bar + 3 * sigma if pd.notna(sigma) else np.nan
-        x_lcl = x_bar - 3 * sigma if pd.notna(sigma) else np.nan
-        mr_cl = mr_bar
-        mr_ucl = d4 * mr_bar if pd.notna(mr_bar) else np.nan
-        mr_lcl = d3 * mr_bar if pd.notna(mr_bar) else np.nan
-
-        for i, v in enumerate(values, start=1):
-            rows.append(
-                {
-                    "dimension": dim,
-                    "index": i,
-                    "value": v,
-                    "MR": mr.iloc[i - 1] if i > 1 else np.nan,
-                    "X_CL": x_bar,
-                    "X_UCL": x_ucl,
-                    "X_LCL": x_lcl,
-                    "MR_CL": mr_cl,
-                    "MR_UCL": mr_ucl,
-                    "MR_LCL": mr_lcl,
-                }
-            )
-
-        summary_rows.append(
-            {
-                "dimension": dim,
-                "count": values.count(),
-                "X_bar": x_bar,
-                "MR_bar": mr_bar,
-                "sigma_est": sigma,
-                "X_UCL": x_ucl,
-                "X_LCL": x_lcl,
-                "MR_UCL": mr_ucl,
-                "MR_LCL": mr_lcl,
-            }
-        )
-
-    return pd.DataFrame(summary_rows), pd.DataFrame(rows)
-
-
-def _download_quality_reports(df: pd.DataFrame) -> None:
-    cp_cpk = _cp_cpk_summary(df)
-    spc_summary, spc_points = _imr_spc_points(df)
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        cp_cpk.to_excel(writer, index=False, sheet_name="cp_cpk_summary")
-        spc_summary.to_excel(writer, index=False, sheet_name="spc_imr_summary")
-        spc_points.to_excel(writer, index=False, sheet_name="spc_imr_points")
-    st.download_button(
-        "下載 CP/CPK + SPC 報表 (Excel)",
-        data=buffer.getvalue(),
-        file_name="quality_report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-
-def _build_report_html(stats: pd.DataFrame, figures: list) -> str:
-    table_html = stats.to_html(index=False, float_format=lambda x: f"{x:.4f}")
-    images_html = "\n".join(
-        [
-            f"<h3>{title}</h3><img style='max-width:100%;' src='data:image/png;base64,{img_b64}'/>"
-            for title, img_b64 in figures
-        ]
-    )
-    return f"""
-<!doctype html>
-<html lang="zh-Hant">
-<head>
-<meta charset="utf-8"/>
-<title>Boxplot Report</title>
-<style>
-body {{ font-family: Arial, sans-serif; padding: 20px; }}
-img {{ margin-bottom: 24px; }}
-</style>
-</head>
-<body>
-<h1>盒鬚圖報表</h1>
-<h2>統計摘要</h2>
-{table_html}
-<h2>圖表</h2>
-{images_html}
-</body>
-</html>
-"""
-
 
 st.title("盒鬚圖分析工具")
 st.caption("上傳單一或多個 Excel，支援自動分組或全部合併，每個維度一張圖。")
@@ -562,20 +61,26 @@ if not uploaded_files:
     st.info("請先上傳 Excel 檔案")
     st.stop()
 
+# Chart settings
 chart_height = st.slider("圖表高度", min_value=360, max_value=900, value=520, step=20)
 focus_on_data = st.checkbox("放大顯示盒鬚圖（以數據為主）", value=True)
 dual_view = st.checkbox("雙圖模式（完整規格 + 放大視圖）", value=False)
 auto_range = st.checkbox("依規格/數據自動縮放", value=True)
 
+# Load and parse files
 all_frames = []
 errors = []
-for file in uploaded_files:
+
+load_progress = st.progress(0, text="正在載入檔案...")
+for i, file in enumerate(uploaded_files):
     df, err = load_excel(file)
     if err:
         errors.append(f"{file.name}: {err}")
         continue
     df["file"] = file.name
     all_frames.append(df)
+    load_progress.progress((i + 1) / len(uploaded_files), text=f"正在載入檔案... ({i + 1}/{len(uploaded_files)})")
+load_progress.empty()
 
 if errors:
     st.warning("以下檔案解析失敗或無資料：")
@@ -588,6 +93,7 @@ if not all_frames:
 
 raw = pd.concat(all_frames, ignore_index=True)
 
+# Display mode selection
 mode = st.radio(
     "顯示模式",
     options=["自動分組", "強制分檔顯示", "全部合併成一張圖"],
@@ -595,6 +101,7 @@ mode = st.radio(
     horizontal=True,
 )
 
+# Calculate file mold counts
 file_list = sorted(raw["file"].dropna().unique().tolist())
 file_mold_counts = {}
 for fname in file_list:
@@ -602,31 +109,10 @@ for fname in file_list:
     molds = [m for m in sub.get("mold", pd.Series(dtype=str)).dropna().unique() if str(m).strip()]
     file_mold_counts[fname] = len(molds)
 
+# Assign groups using vectorized function
+raw["group"] = assign_groups_vectorized(raw, mode, file_mold_counts, file_list)
 
-def _format_pos(x) -> str:
-    if pd.isna(x):
-        return "P?"
-    return f"P{int(float(x))}"
-
-
-if mode == "全部合併成一張圖":
-    raw["group"] = "合併"
-else:
-    def _group_for_row(row) -> str:
-        fname = row.get("file")
-        multi_mold = file_mold_counts.get(fname, 0) >= 2
-        if mode == "強制分檔顯示":
-            if multi_mold:
-                return f"{fname} {_format_pos(row.get('pos_in_mold'))}"
-            return f"{fname} 合併"
-        if multi_mold:
-            return _format_pos(row.get("pos_in_mold"))
-        if len(file_list) <= 1:
-            return "合併"
-        return f"{fname} 合併"
-
-    raw["group"] = raw.apply(_group_for_row, axis=1)
-
+# Dimension selection
 all_dimensions = sorted(raw["dimension"].dropna().unique().tolist())
 
 search_text = st.text_input("維度搜尋", value="", placeholder="例如：1-A, 2-B, 2/A1")
@@ -649,119 +135,470 @@ max_charts = st.number_input(
     step=1,
 )
 
-stats = _stats_table(raw)
+# Calculate statistics
+stats = stats_table(raw)
 
-st.download_button(
-    "一鍵匯出整理後的長表 CSV",
-    data=raw.to_csv(index=False).encode("utf-8-sig"),
-    file_name="boxplot_long_table.csv",
-    mime="text/csv",
-)
+# Download buttons
+col_dl1, col_dl2, col_dl3, col_dl4 = st.columns(4)
+with col_dl1:
+    st.download_button(
+        "匯出長表 CSV",
+        data=raw.to_csv(index=False).encode("utf-8-sig"),
+        file_name="boxplot_long_table.csv",
+        mime="text/csv",
+    )
+with col_dl2:
+    download_stats_excel(stats, "boxplot_summary.xlsx")
+with col_dl3:
+    download_quality_reports(raw)
+with col_dl4:
+    # Generate PDF report with all charts
+    if st.button("產生完整 PDF 報表", key="gen_pdf"):
+        with st.spinner("正在產生 PDF 報表..."):
+            cpk_df = cpk_with_rating(raw)
+            pdf_figures = []
 
-_download_stats_excel(stats, "boxplot_summary.xlsx")
-_download_quality_reports(raw)
+            # Generate charts for PDF
+            pdf_progress = st.progress(0, text="正在產生圖表...")
+            dims_to_include = selected_dimensions[:min(len(selected_dimensions), max_charts)]
 
-shown = 0
-fig_cache = []
-for dim in selected_dimensions:
-    if shown >= max_charts:
-        break
-    sub = raw[raw["dimension"] == dim].copy()
-    if sub.empty:
-        continue
+            for i, dim in enumerate(dims_to_include):
+                sub = raw[raw["dimension"] == dim].copy()
+                if sub.empty:
+                    continue
+                nominal, upper, lower, _ = pick_spec_values(sub)
+                fig = build_fig(sub, dim, 400)
+                add_spec_lines(fig, nominal, upper, lower)
+                add_out_of_spec_points(fig, sub, lower, upper)
+                try:
+                    img_bytes = fig.to_image(format="png", scale=2)
+                    pdf_figures.append((dim, img_bytes))
+                except Exception:
+                    pass
+                pdf_progress.progress((i + 1) / len(dims_to_include))
 
-    nominal, upper, lower, spec_versions = _pick_spec_values(sub)
+            pdf_progress.empty()
 
-    if dual_view:
-        st.markdown("**完整規格視圖**")
-        fig_full = _build_fig(sub, dim, chart_height)
-        _add_spec_lines(fig_full, nominal, upper, lower)
-        _add_out_of_spec_points(fig_full, sub, lower, upper)
-        if auto_range:
-            _apply_y_range(fig_full, sub, lower, upper, False)
-        st.plotly_chart(fig_full, use_container_width=True)
+            if pdf_figures:
+                download_pdf_report_button(stats, cpk_df, pdf_figures, "quality_report.pdf")
+            else:
+                st.warning("無法產生圖表，請確認已安裝 kaleido")
 
-        st.markdown("**放大視圖**")
-        fig_zoom = _build_fig(sub, dim, chart_height)
-        _add_spec_lines(fig_zoom, nominal, upper, lower)
-        _add_out_of_spec_points(fig_zoom, sub, lower, upper)
-        if auto_range:
-            y_min, y_max = _apply_y_range(fig_zoom, sub, lower, upper, True)
-            _add_spec_edge_markers(fig_zoom, lower, upper, y_min, y_max)
-        st.plotly_chart(fig_zoom, use_container_width=True)
+# Create tabbed interface
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["盒鬚圖", "Cpk 分析", "SPC 控制圖", "標準化偏離", "模次比較"])
 
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            _download_plot_button(fig_full, f"{dim}_full.png")
-        with c2:
-            _download_plot_button(fig_zoom, f"{dim}_zoom.png")
-        with c3:
-            _download_excel_button(sub, f"{dim}.xlsx")
-        with c4:
-            st.caption("")
+# Tab 1: Box-and-Whisker Plots (original functionality)
+with tab1:
+    st.subheader("盒鬚圖")
 
-        try:
-            img_bytes = fig_full.to_image(format="png", scale=2)
-            fig_cache.append((f"{dim} (full)", base64.b64encode(img_bytes).decode("ascii"), img_bytes))
-        except Exception:
-            pass
-        try:
-            img_bytes = fig_zoom.to_image(format="png", scale=2)
-            fig_cache.append((f"{dim} (zoom)", base64.b64encode(img_bytes).decode("ascii"), img_bytes))
-        except Exception:
-            pass
+    total_charts = min(len(selected_dimensions), max_charts)
+    if total_charts > 0:
+        progress = st.progress(0, text="正在生成圖表...")
+        shown = 0
+        fig_cache = []
+
+        for i, dim in enumerate(selected_dimensions):
+            if shown >= max_charts:
+                break
+            sub = raw[raw["dimension"] == dim].copy()
+            if sub.empty:
+                continue
+
+            nominal, upper, lower, spec_versions = pick_spec_values(sub)
+
+            if dual_view:
+                st.markdown("**完整規格視圖**")
+                fig_full = build_fig(sub, dim, chart_height)
+                add_spec_lines(fig_full, nominal, upper, lower)
+                add_out_of_spec_points(fig_full, sub, lower, upper)
+                if auto_range:
+                    apply_y_range(fig_full, sub, lower, upper, False)
+                st.plotly_chart(fig_full, use_container_width=True)
+
+                st.markdown("**放大視圖**")
+                fig_zoom = build_fig(sub, dim, chart_height)
+                add_spec_lines(fig_zoom, nominal, upper, lower)
+                add_out_of_spec_points(fig_zoom, sub, lower, upper)
+                if auto_range:
+                    y_min, y_max = apply_y_range(fig_zoom, sub, lower, upper, True)
+                    add_spec_edge_markers(fig_zoom, lower, upper, y_min, y_max)
+                st.plotly_chart(fig_zoom, use_container_width=True)
+
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    download_plot_button(fig_full, f"{dim}_full.png")
+                with c2:
+                    download_plot_button(fig_zoom, f"{dim}_zoom.png")
+                with c3:
+                    download_excel_button(sub, f"{dim}.xlsx")
+                with c4:
+                    st.caption("")
+
+                try:
+                    img_bytes = fig_full.to_image(format="png", scale=2)
+                    fig_cache.append((f"{dim} (full)", base64.b64encode(img_bytes).decode("ascii"), img_bytes))
+                except Exception:
+                    pass
+                try:
+                    img_bytes = fig_zoom.to_image(format="png", scale=2)
+                    fig_cache.append((f"{dim} (zoom)", base64.b64encode(img_bytes).decode("ascii"), img_bytes))
+                except Exception:
+                    pass
+            else:
+                fig = build_fig(sub, dim, chart_height)
+                add_spec_lines(fig, nominal, upper, lower)
+                add_out_of_spec_points(fig, sub, lower, upper)
+                if auto_range:
+                    y_min, y_max = apply_y_range(fig, sub, lower, upper, focus_on_data)
+                    if focus_on_data:
+                        add_spec_edge_markers(fig, lower, upper, y_min, y_max)
+
+                st.plotly_chart(fig, use_container_width=True)
+
+                col_left, col_right = st.columns(2)
+                with col_left:
+                    download_plot_button(fig, f"{dim}.png")
+                with col_right:
+                    download_excel_button(sub, f"{dim}.xlsx")
+
+                try:
+                    img_bytes = fig.to_image(format="png", scale=2)
+                    fig_cache.append((dim, base64.b64encode(img_bytes).decode("ascii"), img_bytes))
+                except Exception:
+                    pass
+
+            if spec_versions > 1:
+                st.caption("注意：此維度在不同檔案中規格不一致，已取第一筆規格作為標示。")
+
+            shown += 1
+            progress.progress((i + 1) / total_charts, text=f"正在生成圖表... ({shown}/{total_charts})")
+
+        progress.empty()
+
+        if shown == 0:
+            st.info("目前選擇的維度沒有可用資料")
+
+        if fig_cache:
+            if st.button("產生圖表 ZIP", key="zip_boxplot"):
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for title, _b64, img_bytes in fig_cache:
+                        zf.writestr(f"{title}.png", img_bytes)
+                    zf.writestr("summary.csv", stats.to_csv(index=False))
+                    zf.writestr("long_table.csv", raw.to_csv(index=False))
+                st.download_button(
+                    "下載全部圖表 ZIP",
+                    data=zip_buffer.getvalue(),
+                    file_name="boxplot_charts.zip",
+                    mime="application/zip",
+                )
+
+            if st.button("產生報表 (HTML)", key="html_boxplot"):
+                figures = [(title, b64) for title, b64, _bytes in fig_cache]
+                report_html = build_report_html(stats, figures)
+                st.download_button(
+                    "下載報表 (HTML)",
+                    data=report_html.encode("utf-8"),
+                    file_name="boxplot_report.html",
+                    mime="text/html",
+                )
     else:
-        fig = _build_fig(sub, dim, chart_height)
-        _add_spec_lines(fig, nominal, upper, lower)
-        _add_out_of_spec_points(fig, sub, lower, upper)
-        if auto_range:
-            y_min, y_max = _apply_y_range(fig, sub, lower, upper, focus_on_data)
-            if focus_on_data:
-                _add_spec_edge_markers(fig, lower, upper, y_min, y_max)
+        st.info("請選擇至少一個維度")
 
-        st.plotly_chart(fig, use_container_width=True)
+# Tab 2: Cpk Analysis
+with tab2:
+    st.subheader("Cpk 分析")
 
-        col_left, col_right = st.columns(2)
-        with col_left:
-            _download_plot_button(fig, f"{dim}.png")
-        with col_right:
-            _download_excel_button(sub, f"{dim}.xlsx")
+    # Calculate Cpk with ratings
+    cpk_df = cpk_with_rating(raw)
 
-        try:
-            img_bytes = fig.to_image(format="png", scale=2)
-            fig_cache.append((dim, base64.b64encode(img_bytes).decode("ascii"), img_bytes))
-        except Exception:
-            pass
+    if not cpk_df.empty:
+        # Show Cpk heatmap
+        cpk_fig = build_cpk_heatmap(cpk_df, height=chart_height)
+        st.plotly_chart(cpk_fig, use_container_width=True)
 
-    if spec_versions > 1:
-        st.caption("注意：此維度在不同檔案中規格不一致，已取第一筆規格作為標示。")
+        # Show Cpk table with colored ratings
+        st.markdown("### Cpk 評級表")
+        st.markdown("""
+        | Cpk 範圍 | 評級 | 顏色 |
+        |----------|------|------|
+        | >= 1.33 | 良好 | 🟢 綠色 |
+        | 1.0 ~ 1.33 | 可接受 | 🟡 黃色 |
+        | < 1.0 | 不良 | 🔴 紅色 |
+        """)
 
-    shown += 1
+        # Format and display table
+        display_df = cpk_df[["dimension", "count", "mean", "std", "USL", "LSL", "Cp", "Cpk", "rating"]].copy()
+        display_df.columns = ["維度", "數量", "平均值", "標準差", "上限", "下限", "Cp", "Cpk", "評級"]
 
-if shown == 0:
-    st.info("目前選擇的維度沒有可用資料")
+        # Style the dataframe
+        def color_rating(val):
+            if val == "良好":
+                return "background-color: #2ecc71; color: white"
+            elif val == "可接受":
+                return "background-color: #f1c40f; color: black"
+            elif val == "不良":
+                return "background-color: #e74c3c; color: white"
+            return ""
 
-if fig_cache:
-    if st.button("產生圖表 ZIP"):
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for title, _b64, img_bytes in fig_cache:
-                zf.writestr(f"{title}.png", img_bytes)
-            zf.writestr("summary.csv", stats.to_csv(index=False))
-            zf.writestr("long_table.csv", raw.to_csv(index=False))
-        st.download_button(
-            "下載全部圖表 ZIP",
-            data=zip_buffer.getvalue(),
-            file_name="boxplot_charts.zip",
-            mime="application/zip",
+        styled_df = display_df.style.applymap(color_rating, subset=["評級"])
+        styled_df = styled_df.format({
+            "平均值": "{:.4f}",
+            "標準差": "{:.4f}",
+            "上限": "{:.4f}",
+            "下限": "{:.4f}",
+            "Cp": "{:.3f}",
+            "Cpk": "{:.3f}",
+        }, na_rep="N/A")
+
+        st.dataframe(styled_df, use_container_width=True)
+
+        # Download button for Cpk report
+        col1, col2 = st.columns(2)
+        with col1:
+            try:
+                cpk_img = cpk_fig.to_image(format="png", scale=3)
+                st.download_button(
+                    "下載 Cpk 圖表 (PNG)",
+                    data=cpk_img,
+                    file_name="cpk_analysis.png",
+                    mime="image/png",
+                )
+            except Exception:
+                st.caption("PNG 下載需要 kaleido")
+        with col2:
+            cpk_buffer = io.BytesIO()
+            with pd.ExcelWriter(cpk_buffer, engine="openpyxl") as writer:
+                cpk_df.to_excel(writer, index=False, sheet_name="cpk_analysis")
+            st.download_button(
+                "下載 Cpk 資料 (Excel)",
+                data=cpk_buffer.getvalue(),
+                file_name="cpk_analysis.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+    else:
+        st.info("無法計算 Cpk，請確認資料包含規格上下限")
+
+# Tab 3: SPC Control Chart
+with tab3:
+    st.subheader("SPC 控制圖 (I-MR)")
+
+    st.markdown("""
+    **說明：** I-MR (Individual-Moving Range) 控制圖用於監控製程穩定性。
+    - **I 圖**：顯示個別量測值與控制限
+    - **MR 圖**：顯示相鄰量測值的移動全距
+    - **紅色圈點**：超出控制限的失控點
+    """)
+
+    # Calculate SPC data
+    spc_summary, spc_points = imr_spc_points(raw)
+
+    if not spc_points.empty:
+        # Dimension selector
+        spc_dims = spc_points["dimension"].unique().tolist()
+        selected_spc_dim = st.selectbox(
+            "選擇維度",
+            options=spc_dims,
+            key="spc_dim_select",
         )
 
-    if st.button("產生報表 (HTML)"):
-        figures = [(title, b64) for title, b64, _bytes in fig_cache]
-        report_html = _build_report_html(stats, figures)
-        st.download_button(
-            "下載報表 (HTML)",
-            data=report_html.encode("utf-8"),
-            file_name="boxplot_report.html",
-            mime="text/html",
+        if selected_spc_dim:
+            # Build and display I-MR chart
+            imr_fig = build_imr_chart(spc_points, selected_spc_dim, height=chart_height + 200)
+            st.plotly_chart(imr_fig, use_container_width=True)
+
+            # Show SPC summary for selected dimension
+            dim_summary = spc_summary[spc_summary["dimension"] == selected_spc_dim]
+            if not dim_summary.empty:
+                row = dim_summary.iloc[0]
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("X̄ (平均值)", f"{row['X_bar']:.4f}")
+                with col2:
+                    st.metric("MR̄ (平均移動全距)", f"{row['MR_bar']:.4f}" if pd.notna(row['MR_bar']) else "N/A")
+                with col3:
+                    st.metric("σ 估計值", f"{row['sigma_est']:.4f}" if pd.notna(row['sigma_est']) else "N/A")
+                with col4:
+                    st.metric("樣本數", f"{int(row['count'])}")
+
+                # Control limits display
+                st.markdown("**控制限：**")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.write(f"I 圖 UCL: {row['X_UCL']:.4f}" if pd.notna(row['X_UCL']) else "I 圖 UCL: N/A")
+                    st.write(f"I 圖 LCL: {row['X_LCL']:.4f}" if pd.notna(row['X_LCL']) else "I 圖 LCL: N/A")
+                with col2:
+                    st.write(f"MR 圖 UCL: {row['MR_UCL']:.4f}" if pd.notna(row['MR_UCL']) else "MR 圖 UCL: N/A")
+                    st.write(f"MR 圖 LCL: 0")
+
+            # Check for out-of-control points
+            dim_points = spc_points[spc_points["dimension"] == selected_spc_dim]
+            x_ucl = dim_points["X_UCL"].iloc[0]
+            x_lcl = dim_points["X_LCL"].iloc[0]
+            mr_ucl = dim_points["MR_UCL"].iloc[0]
+
+            ooc_x = dim_points[(dim_points["value"] > x_ucl) | (dim_points["value"] < x_lcl)]
+            ooc_mr = dim_points[dim_points["MR"] > mr_ucl] if pd.notna(mr_ucl) else pd.DataFrame()
+
+            if not ooc_x.empty or not ooc_mr.empty:
+                st.warning(f"⚠️ 發現失控點：I 圖 {len(ooc_x)} 點，MR 圖 {len(ooc_mr)} 點")
+
+            # Download buttons
+            col1, col2 = st.columns(2)
+            with col1:
+                try:
+                    spc_img = imr_fig.to_image(format="png", scale=3)
+                    st.download_button(
+                        "下載 SPC 圖 (PNG)",
+                        data=spc_img,
+                        file_name=f"{selected_spc_dim}_spc.png",
+                        mime="image/png",
+                        key="spc_png",
+                    )
+                except Exception:
+                    st.caption("PNG 下載需要 kaleido")
+            with col2:
+                spc_buffer = io.BytesIO()
+                with pd.ExcelWriter(spc_buffer, engine="openpyxl") as writer:
+                    dim_points.to_excel(writer, index=False, sheet_name="spc_data")
+                    if not dim_summary.empty:
+                        dim_summary.to_excel(writer, index=False, sheet_name="spc_summary")
+                st.download_button(
+                    "下載 SPC 資料 (Excel)",
+                    data=spc_buffer.getvalue(),
+                    file_name=f"{selected_spc_dim}_spc.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="spc_xlsx",
+                )
+    else:
+        st.info("無法計算 SPC 控制圖資料")
+
+# Tab 4: Normalized Deviation
+with tab4:
+    st.subheader("標準化偏離分析")
+
+    deviation_df = calculate_normalized_deviation(raw)
+
+    if not deviation_df.empty:
+        st.markdown("""
+        **公式說明：**
+        - 偏離% = (量測值 - 規格中值) / 公差 × 100%
+        - 公差 = (上限 - 下限) / 2
+        - ±100% 代表剛好在規格邊界
+        """)
+
+        # Dimension selector for deviation chart
+        deviation_dims = deviation_df["dimension"].unique().tolist()
+        selected_dev_dim = st.selectbox(
+            "選擇維度",
+            options=deviation_dims,
+            key="deviation_dim_select",
         )
+
+        if selected_dev_dim:
+            dev_fig = build_normalized_deviation_chart(deviation_df, selected_dev_dim, chart_height)
+            st.plotly_chart(dev_fig, use_container_width=True)
+
+            # Show summary statistics for deviation
+            dim_dev = deviation_df[deviation_df["dimension"] == selected_dev_dim]
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("平均偏離", f"{dim_dev['deviation_pct'].mean():.1f}%")
+            with col2:
+                st.metric("最大偏離", f"{dim_dev['deviation_pct'].max():.1f}%")
+            with col3:
+                st.metric("最小偏離", f"{dim_dev['deviation_pct'].min():.1f}%")
+            with col4:
+                out_count = (dim_dev['deviation_pct'].abs() > 100).sum()
+                st.metric("超規格點數", f"{out_count}")
+
+            # Download buttons
+            col1, col2 = st.columns(2)
+            with col1:
+                try:
+                    dev_img = dev_fig.to_image(format="png", scale=3)
+                    st.download_button(
+                        "下載偏離圖 (PNG)",
+                        data=dev_img,
+                        file_name=f"{selected_dev_dim}_deviation.png",
+                        mime="image/png",
+                        key="dev_png",
+                    )
+                except Exception:
+                    st.caption("PNG 下載需要 kaleido")
+            with col2:
+                dev_buffer = io.BytesIO()
+                with pd.ExcelWriter(dev_buffer, engine="openpyxl") as writer:
+                    dim_dev.to_excel(writer, index=False, sheet_name="deviation")
+                st.download_button(
+                    "下載偏離資料 (Excel)",
+                    data=dev_buffer.getvalue(),
+                    file_name=f"{selected_dev_dim}_deviation.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dev_xlsx",
+                )
+    else:
+        st.info("無法計算標準化偏離，請確認資料包含完整的規格中值與上下限")
+
+# Tab 5: Position Comparison
+with tab5:
+    st.subheader("模次比較分析")
+
+    # Check if we have multi-position data
+    has_positions = raw["pos_in_mold"].notna().any()
+
+    if has_positions:
+        st.markdown("""
+        **說明：** 此圖表用於比較不同模次位置 (P1, P2, P3...) 的量測分布。
+        適用於多模次檔案或包含位置資訊的資料。
+        """)
+
+        # Dimension selector for position comparison
+        pos_dims = selected_dimensions if selected_dimensions else all_dimensions
+        selected_pos_dim = st.selectbox(
+            "選擇維度",
+            options=pos_dims,
+            key="position_dim_select",
+        )
+
+        if selected_pos_dim:
+            pos_fig = build_position_comparison_chart(raw, selected_pos_dim, chart_height)
+            st.plotly_chart(pos_fig, use_container_width=True)
+
+            # Show position statistics
+            pos_sub = raw[raw["dimension"] == selected_pos_dim].copy()
+            pos_sub["position"] = pos_sub["pos_in_mold"].apply(
+                lambda x: f"P{int(x)}" if pd.notna(x) else "P?"
+            )
+
+            pos_stats = pos_sub.groupby("position")["value"].agg(["count", "mean", "std", "min", "max"])
+            pos_stats.columns = ["數量", "平均值", "標準差", "最小值", "最大值"]
+            st.dataframe(pos_stats.style.format("{:.4f}", subset=["平均值", "標準差", "最小值", "最大值"]), use_container_width=True)
+
+            # Download buttons
+            col1, col2 = st.columns(2)
+            with col1:
+                try:
+                    pos_img = pos_fig.to_image(format="png", scale=3)
+                    st.download_button(
+                        "下載模次比較圖 (PNG)",
+                        data=pos_img,
+                        file_name=f"{selected_pos_dim}_position.png",
+                        mime="image/png",
+                        key="pos_png",
+                    )
+                except Exception:
+                    st.caption("PNG 下載需要 kaleido")
+            with col2:
+                pos_buffer = io.BytesIO()
+                with pd.ExcelWriter(pos_buffer, engine="openpyxl") as writer:
+                    pos_sub.to_excel(writer, index=False, sheet_name="position_data")
+                st.download_button(
+                    "下載模次資料 (Excel)",
+                    data=pos_buffer.getvalue(),
+                    file_name=f"{selected_pos_dim}_position.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="pos_xlsx",
+                )
+    else:
+        st.info("資料中未包含模次位置資訊 (pos_in_mold)，無法進行模次比較分析。")

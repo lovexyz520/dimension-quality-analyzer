@@ -15,43 +15,99 @@ Dimension Quality Analyzer 是一個製造業品質分析 Web 應用程式，用
 - **openpyxl** - Excel 讀寫
 - **NumPy** - 數值計算
 - **Kaleido** - Plotly 圖表轉 PNG
+- **fpdf2** - PDF 報表產生
 
 ## 專案結構
 
 ```
 dimension-quality-analyzer/
-├── streamlit_app.py      # 主應用程式（所有邏輯在此檔案）
-├── requirements.txt      # Python 依賴
-├── pyproject.toml        # 專案配置（UV 套件管理）
+├── streamlit_app.py          # UI 主程式
+├── core/                     # 核心模組
+│   ├── __init__.py           # 模組匯出
+│   ├── excel_parser.py       # Excel 解析
+│   ├── statistics.py         # 統計計算
+│   ├── visualization.py      # 圖表繪製
+│   ├── export.py             # 匯出功能
+│   └── grouping.py           # 分組邏輯
+├── requirements.txt          # Python 依賴
+├── pyproject.toml            # 專案配置（UV 套件管理）
 ├── .streamlit/
-│   └── config.toml       # Streamlit 配置
+│   └── config.toml           # Streamlit 配置
 └── sample_data/
-    └── template.xlsx     # Excel 範本
+    └── template.xlsx         # Excel 範本
 ```
 
-## 程式碼架構 (streamlit_app.py)
+## 模組架構
 
-### 核心函數
+### core/excel_parser.py
+| 函數 | 功能 |
+|------|------|
+| `_find_header_row()` | 尋找含「規格」與「球標」的標題列 |
+| `_find_col_index()` | 尋找指定標籤的欄位索引 |
+| `_clean_cell()` | 清理儲存格值 |
+| `_detect_focus_sheet()` | 自動偵測「重點尺寸」工作表 |
+| `_extract_mold_and_pos()` | 提取模次與位置資訊 |
+| `parse_focus_dimensions()` | 解析 Excel 數據為標準格式 |
+| `load_excel()` | Excel 檔案載入入口 |
 
-| 函數 | 行數 | 功能 |
-|------|------|------|
-| `_find_header_row()` | 16-21 | 尋找含「規格」與「球標」的標題列 |
-| `_detect_focus_sheet()` | 39-52 | 自動偵測「重點尺寸」工作表 |
-| `parse_focus_dimensions()` | 55-140 | 解析 Excel 數據為標準格式 |
-| `load_excel()` | 143-155 | Excel 檔案載入入口 |
-| `_build_fig()` | 217-234 | 建立 Plotly 盒鬚圖 |
-| `_add_spec_lines()` | 177-214 | 新增規格線標註 |
-| `_stats_table()` | 330-351 | 計算統計摘要 |
-| `_cp_cpk_summary()` | 366-393 | 計算 Cp/Cpk 製程能力 |
-| `_imr_spc_points()` | 396-448 | 計算 I-MR 控制圖數據 |
+### core/statistics.py
+| 函數 | 功能 |
+|------|------|
+| `calc_out_of_spec()` | 計算超規格點 |
+| `pick_spec_values()` | 取得規格值 |
+| `stats_table()` | 計算統計摘要 |
+| `cp_cpk_summary()` | 計算 Cp/Cpk 製程能力 |
+| `cpk_with_rating()` | Cpk 加上評級與顏色 |
+| `imr_spc_points()` | 計算 I-MR 控制圖數據 |
+| `calculate_normalized_deviation()` | 計算標準化偏離 |
 
-### 資料流
+### core/visualization.py
+| 函數 | 功能 |
+|------|------|
+| `add_spec_lines()` | 新增規格線標註 |
+| `build_fig()` | 建立 Plotly 盒鬚圖 |
+| `apply_y_range()` | 套用 Y 軸範圍 |
+| `add_spec_edge_markers()` | 新增規格邊界標記 |
+| `add_out_of_spec_points()` | 標記超規格點 |
+| `build_cpk_heatmap()` | 建立 Cpk 熱力圖 |
+| `build_normalized_deviation_chart()` | 建立標準化偏離圖 |
+| `build_position_comparison_chart()` | 建立模次比較圖 |
+| `build_imr_chart()` | 建立 I-MR SPC 控制圖 |
+
+### core/export.py
+| 函數 | 功能 |
+|------|------|
+| `download_plot_button()` | 圖表 PNG 下載按鈕 |
+| `download_excel_button()` | Excel 資料下載按鈕 |
+| `download_stats_excel()` | 統計摘要 Excel 下載 |
+| `download_quality_reports()` | CP/CPK + SPC 報表下載 |
+| `build_report_html()` | 建立 HTML 報表 |
+| `generate_pdf_report()` | 產生 PDF 報表 |
+| `download_pdf_report_button()` | PDF 報表下載按鈕 |
+
+### core/grouping.py
+| 函數 | 功能 |
+|------|------|
+| `format_pos()` | 格式化位置標籤 (P1, P2...) |
+| `assign_groups_vectorized()` | 向量化分組邏輯 |
+
+## UI 分頁結構
+
+應用程式使用分頁式介面：
+
+1. **盒鬚圖** - 原有的盒鬚圖分析功能
+2. **Cpk 分析** - Cpk 熱力圖與評級表
+3. **SPC 控制圖** - I-MR 控制圖（製程穩定性監控）
+4. **標準化偏離** - 標準化偏離圖（相對於規格公差的偏離百分比）
+5. **模次比較** - 多模次位置比較圖
+
+## 資料流
 
 ```
-Excel 上傳 → _detect_focus_sheet() → parse_focus_dimensions()
-    → DataFrame (dimension, value, nominal, upper, lower)
-    → _build_fig() → Plotly 圖表
-    → _stats_table() / _cp_cpk_summary() → 統計報表
+Excel 上傳 → load_excel() → parse_focus_dimensions()
+    → DataFrame (dimension, value, nominal, upper, lower, mold, pos_in_mold)
+    → assign_groups_vectorized() → 分組
+    → 各分頁視覺化與統計
 ```
 
 ## 開發指令
@@ -85,6 +141,37 @@ pip install -r requirements.txt
 - 支援多檔案合併或分檔比較模式
 - 顯示模式包含：自動分組、強制分檔顯示、全部合併成一張圖
 - 多模次檔案會依位置列自動分組成 P1..Pn
+
+## Cpk 評級標準
+
+| Cpk 範圍 | 評級 | 顏色 |
+|----------|------|------|
+| >= 1.33 | 良好 | 綠色 |
+| 1.0 ~ 1.33 | 可接受 | 黃色 |
+| < 1.0 | 不良 | 紅色 |
+
+## 標準化偏離公式
+
+```
+偏離% = (量測值 - 規格中值) / 公差 × 100%
+公差 = (上限 - 下限) / 2
+```
+
+## SPC 控制圖 (I-MR)
+
+I-MR 控制圖用於監控製程穩定性：
+
+- **I 圖 (Individual Chart)**：顯示個別量測值
+  - CL = X̄ (平均值)
+  - UCL = X̄ + 3σ
+  - LCL = X̄ - 3σ
+
+- **MR 圖 (Moving Range Chart)**：顯示相鄰量測值的差異
+  - CL = MR̄ (平均移動全距)
+  - UCL = D4 × MR̄ (D4 = 3.267)
+  - LCL = 0
+
+失控點（超出控制限）以紅色圈點標記。
 
 ## 部署
 
