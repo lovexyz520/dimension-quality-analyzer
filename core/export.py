@@ -253,7 +253,7 @@ def generate_pdf_report(
             # A4 Landscape: 297mm x 210mm, with margins
             pdf.image(tmp.name, x=10, y=30, w=277)
 
-    return pdf.output()
+    return bytes(pdf.output())
 
 
 def download_pdf_report_button(
