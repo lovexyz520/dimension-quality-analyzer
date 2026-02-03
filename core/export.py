@@ -114,7 +114,7 @@ def generate_pdf_report(
     stats: pd.DataFrame,
     cpk_df: pd.DataFrame,
     figures: List[Tuple[str, bytes]],
-    title: str = "品質分析報表",
+    title: str = "Quality Analysis Report",
 ) -> bytes:
     """Generate PDF report with statistics and figures.
 
@@ -130,6 +130,35 @@ def generate_pdf_report(
     from fpdf import FPDF
 
     class PDF(FPDF):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # Add Unicode font for CJK support
+            # Using Noto Sans TC from Google Fonts
+            self.add_font("NotoSansTC", style="", fname="", uni=True)
+            self._use_cjk = False
+
+        def _try_add_cjk_font(self):
+            """Try to add CJK font, fallback to Helvetica if not available."""
+            if self._use_cjk:
+                return True
+            try:
+                # Try to use Noto Sans SC from fontTools or system
+                import urllib.request
+                import os
+
+                font_url = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf"
+                font_dir = tempfile.gettempdir()
+                font_path = os.path.join(font_dir, "NotoSansCJKsc-Regular.otf")
+
+                if not os.path.exists(font_path):
+                    urllib.request.urlretrieve(font_url, font_path)
+
+                self.add_font("NotoSans", fname=font_path)
+                self._use_cjk = True
+                return True
+            except Exception:
+                return False
+
         def header(self):
             self.set_font("Helvetica", "B", 16)
             self.cell(0, 10, title, align="C", new_x="LMARGIN", new_y="NEXT")
@@ -139,6 +168,26 @@ def generate_pdf_report(
             self.set_y(-15)
             self.set_font("Helvetica", "I", 8)
             self.cell(0, 10, f"Page {self.page_no()}/{{nb}}", align="C")
+
+        def safe_cell(self, w, h, txt, border=0, align="C", fill=False):
+            """Write cell with fallback for non-ASCII characters."""
+            # Replace non-ASCII characters with ASCII equivalents for dimension names
+            safe_txt = self._make_safe_text(txt)
+            self.cell(w, h, safe_txt, border=border, align=align, fill=fill)
+
+        def _make_safe_text(self, text):
+            """Convert text to ASCII-safe version."""
+            if not text:
+                return ""
+            # Keep ASCII characters and common symbols
+            result = []
+            for char in str(text):
+                if ord(char) < 128:
+                    result.append(char)
+                else:
+                    # Replace CJK with placeholder or skip
+                    result.append("?")
+            return "".join(result)
 
     pdf = PDF(orientation="L", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -151,7 +200,6 @@ def generate_pdf_report(
     pdf.ln(3)
 
     # Create stats table
-    pdf.set_font("Helvetica", "", 8)
     cols = ["dimension", "count", "mean", "std", "min", "max", "nominal", "upper", "lower", "out_of_spec"]
     col_widths = [50, 15, 25, 25, 25, 25, 25, 25, 25, 20]
 
@@ -171,7 +219,7 @@ def generate_pdf_report(
                 text = f"{val:.4f}" if pd.notna(val) else "N/A"
             else:
                 text = str(val)[:20]  # Truncate long dimension names
-            pdf.cell(w, 6, text, border=1, align="C")
+            pdf.safe_cell(w, 6, text, border=1, align="C")
         pdf.ln()
 
     # Page 2: Cpk Summary
@@ -209,17 +257,23 @@ def generate_pdf_report(
                 val = row.get(col, "")
                 if isinstance(val, float):
                     text = f"{val:.4f}" if pd.notna(val) else "N/A"
+                elif col == "rating":
+                    # Convert Chinese rating to English
+                    rating_map = {"良好": "Good", "可接受": "OK", "不良": "Poor", "N/A": "N/A"}
+                    text = rating_map.get(str(val), str(val))
                 else:
                     text = str(val)[:20]
                 fill = col in ["Cpk", "rating"]
-                pdf.cell(w, 6, text, border=1, align="C", fill=fill)
+                pdf.safe_cell(w, 6, text, border=1, align="C", fill=fill)
             pdf.ln()
 
-    # Chart pages
+    # Chart pages - charts contain Chinese text as images, which is fine
     for chart_title, img_bytes in figures:
         pdf.add_page()
         pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(0, 10, chart_title, new_x="LMARGIN", new_y="NEXT")
+        # Convert chart title to safe ASCII
+        safe_title = pdf._make_safe_text(chart_title)
+        pdf.cell(0, 10, safe_title, new_x="LMARGIN", new_y="NEXT")
 
         # Save image to temp file and add to PDF
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
