@@ -130,35 +130,6 @@ def generate_pdf_report(
     from fpdf import FPDF
 
     class PDF(FPDF):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            # Add Unicode font for CJK support
-            # Using Noto Sans TC from Google Fonts
-            self.add_font("NotoSansTC", style="", fname="", uni=True)
-            self._use_cjk = False
-
-        def _try_add_cjk_font(self):
-            """Try to add CJK font, fallback to Helvetica if not available."""
-            if self._use_cjk:
-                return True
-            try:
-                # Try to use Noto Sans SC from fontTools or system
-                import urllib.request
-                import os
-
-                font_url = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf"
-                font_dir = tempfile.gettempdir()
-                font_path = os.path.join(font_dir, "NotoSansCJKsc-Regular.otf")
-
-                if not os.path.exists(font_path):
-                    urllib.request.urlretrieve(font_url, font_path)
-
-                self.add_font("NotoSans", fname=font_path)
-                self._use_cjk = True
-                return True
-            except Exception:
-                return False
-
         def header(self):
             self.set_font("Helvetica", "B", 16)
             self.cell(0, 10, title, align="C", new_x="LMARGIN", new_y="NEXT")
