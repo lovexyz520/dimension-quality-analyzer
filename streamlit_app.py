@@ -3,7 +3,9 @@
 import base64
 import io
 import os
+import re
 import zipfile
+from collections import defaultdict
 
 # Kaleido needs sandbox disabled on Cloud environment
 os.environ["KALEIDO_DISABLE_SANDBOX"] = "1"
@@ -45,6 +47,129 @@ from core import (
     assign_groups_vectorized,
 )
 
+
+# ============================================================================
+# Helper functions for smart grouping
+# ============================================================================
+
+def _analyze_tag_structure(tags: list) -> dict:
+    """Analyze the structure of pos_tag labels.
+
+    Identifies patterns like #1-1, #2-3 (cavity-cycle format).
+
+    Returns:
+        dict with keys: format, cavities, cycles, tags_by_cavity
+    """
+    result = {
+        "format": "unknown",
+        "cavities": set(),
+        "cycles": set(),
+        "tags_by_cavity": defaultdict(list),
+        "all_tags": tags,
+    }
+
+    # Pattern: #1-1, #2-3, 1-1, 2/3, etc.
+    cavity_cycle_pattern = re.compile(r"#?\s*(\d+)\s*[-_/]\s*(\d+)")
+
+    parsed_count = 0
+    for tag in tags:
+        tag_str = str(tag).strip()
+        match = cavity_cycle_pattern.search(tag_str)
+        if match:
+            cavity = int(match.group(1))
+            cycle = int(match.group(2))
+            result["cavities"].add(cavity)
+            result["cycles"].add(cycle)
+            result["tags_by_cavity"][cavity].append(tag_str)
+            parsed_count += 1
+
+    if parsed_count > 0 and parsed_count >= len(tags) * 0.5:
+        result["format"] = "cavity-cycle"
+        result["cavities"] = sorted(result["cavities"])
+        result["cycles"] = sorted(result["cycles"])
+        # Sort tags within each cavity by cycle number
+        for cavity in result["tags_by_cavity"]:
+            result["tags_by_cavity"][cavity] = sorted(
+                result["tags_by_cavity"][cavity],
+                key=lambda t: int(cavity_cycle_pattern.search(t).group(2)) if cavity_cycle_pattern.search(t) else 0
+            )
+    else:
+        result["format"] = "simple"
+
+    return result
+
+
+def _generate_grouping_suggestion(raw_df: pd.DataFrame, file_list: list, start_p: int = 1) -> str:
+    """Generate smart grouping suggestion based on file structure.
+
+    Args:
+        raw_df: DataFrame with file and pos_tag columns
+        file_list: List of filenames
+        start_p: Starting P number
+
+    Returns:
+        Suggested grouping rules as string
+    """
+    lines = []
+    current_p = start_p
+
+    for fname in file_list:
+        sub = raw_df[raw_df["file"] == fname]
+        if "pos_tag" not in sub.columns:
+            continue
+
+        tags = sub["pos_tag"].dropna().unique().tolist()
+        if not tags:
+            continue
+
+        analysis = _analyze_tag_structure(tags)
+
+        lines.append(f"# {fname}")
+
+        if analysis["format"] == "cavity-cycle" and analysis["tags_by_cavity"]:
+            # Group by cavity
+            for cavity in sorted(analysis["tags_by_cavity"].keys()):
+                cavity_tags = analysis["tags_by_cavity"][cavity]
+                lines.append(f"P{current_p}: {','.join(cavity_tags)}")
+                current_p += 1
+        else:
+            # Simple: all tags in one group
+            lines.append(f"P{current_p}: {','.join(str(t) for t in sorted(tags))}")
+            current_p += 1
+
+        lines.append("")  # Empty line between files
+
+    return "\n".join(lines).strip()
+
+
+def _get_grouping_details(raw_df: pd.DataFrame) -> dict:
+    """Get details of how data is grouped.
+
+    Returns:
+        dict mapping group name to dict of {filename: [tags]}
+    """
+    details = defaultdict(lambda: defaultdict(list))
+
+    for _, row in raw_df.iterrows():
+        group = row.get("group", "")
+        file_name = row.get("file", "")
+        tag = row.get("pos_tag", "")
+
+        if pd.notna(tag) and str(tag).strip():
+            if str(tag) not in details[group][file_name]:
+                details[group][file_name].append(str(tag))
+
+    # Sort tags within each file
+    for group in details:
+        for file_name in details[group]:
+            details[group][file_name] = sorted(details[group][file_name])
+
+    return dict(details)
+
+
+# ============================================================================
+# Streamlit App
+# ============================================================================
 
 st.set_page_config(page_title="Box-and-Whisker Plot", layout="wide")
 
@@ -119,17 +244,39 @@ if use_custom_grouping:
             sub = raw[raw["file"] == fname]
             tags = sub["pos_tag"].dropna().unique().tolist() if "pos_tag" in sub.columns else []
             if tags:
-                st.write(f"**{fname}**: {', '.join(str(t) for t in sorted(tags)[:20])}")
+                analysis = _analyze_tag_structure(tags)
+                st.write(f"**{fname}**")
+                if analysis["format"] == "cavity-cycle":
+                    st.write(f"  - 格式: 穴號-模次")
+                    st.write(f"  - 穴數: {len(analysis['cavities'])} ({', '.join(map(str, analysis['cavities']))})")
+                    st.write(f"  - 模次: {len(analysis['cycles'])} ({', '.join(map(str, analysis['cycles']))})")
+                st.write(f"  - 標籤: {', '.join(str(t) for t in sorted(tags)[:20])}")
                 if len(tags) > 20:
-                    st.caption(f"...還有 {len(tags) - 20} 個標籤")
+                    st.caption(f"    ...還有 {len(tags) - 20} 個標籤")
+
+    # Smart grouping suggestion
+    col_suggest, col_start = st.columns([3, 1])
+    with col_start:
+        start_p_num = st.number_input("起始編號", min_value=1, value=1, step=1, help="P 編號從幾開始")
+    with col_suggest:
+        if st.button("🔮 智能分組建議", help="根據檔案結構自動生成分組規則"):
+            suggestion = _generate_grouping_suggestion(raw, file_list, start_p_num)
+            st.session_state["grouping_suggestion"] = suggestion
+
+    # Use suggestion if available
+    default_value = st.session_state.get(
+        "grouping_suggestion",
+        "# 檔案1.xlsm\nP1: #1-1,#1-2,#1-3,#1-4,#1-5\nP2: #2-1,#2-2,#2-3,#2-4,#2-5\n\n# 檔案2.xlsm\nP5: #1-1,#1-2\nP6: #2-1,#2-2"
+    )
 
     custom_groups = st.text_area(
         "自訂分組格式",
-        value="# 檔案1.xlsm\nP1: #1-1,#1-2,#1-3,#1-4,#1-5\nP2: #2-1,#2-2,#2-3,#2-4,#2-5\n\n# 檔案2.xlsm\nP5: #1-1,#1-2\nP6: #2-1,#2-2",
+        value=default_value,
         help="格式說明：\n"
              "• 簡單格式：群組名稱: 標籤1,標籤2,...\n"
              "• 按檔案分組：先用 # 檔案名稱 指定檔案，接著定義該檔案的分組規則\n"
-             "• 當多檔案有相同標籤時，請使用按檔案分組格式避免誤判",
+             "• 當多檔案有相同標籤時，請使用按檔案分組格式避免誤判\n"
+             "• 點擊「智能分組建議」可自動生成規則",
         height=200,
     )
 
@@ -259,6 +406,49 @@ else:
             base_group.loc[sub.index] = fallback
 
     raw["group"] = _apply_group_labels(base_group)
+
+# Show grouping details
+with st.expander("📋 查看分組詳情", expanded=False):
+    grouping_details = _get_grouping_details(raw)
+    if grouping_details:
+        # Sort groups naturally (P1, P2, ... P10, P11)
+        def natural_sort_key(s):
+            return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
+
+        sorted_groups = sorted(grouping_details.keys(), key=natural_sort_key)
+
+        st.markdown("**目前分組方式：**")
+
+        # Display mode info
+        if mode == "全部合併成一張圖":
+            st.info("模式：全部合併成一張圖（所有數據合併顯示）")
+        elif mode == "強制分檔顯示":
+            st.info("模式：強制分檔顯示（按檔案 + 位置分組）")
+        else:
+            st.info("模式：自動分組（按穴號/位置自動分配）")
+
+        # Create columns for better layout
+        cols = st.columns(min(3, len(sorted_groups)) if sorted_groups else 1)
+
+        for i, group in enumerate(sorted_groups):
+            col_idx = i % len(cols)
+            with cols[col_idx]:
+                file_tags = grouping_details[group]
+                st.markdown(f"**{group}**")
+                for file_name, tags in sorted(file_tags.items()):
+                    if len(file_list) > 1:
+                        st.write(f"  `{file_name}`:")
+                    st.write(f"  {', '.join(tags[:10])}")
+                    if len(tags) > 10:
+                        st.caption(f"  ...共 {len(tags)} 個標籤")
+                st.markdown("---")
+
+        # Summary statistics
+        total_groups = len(sorted_groups)
+        total_points = len(raw)
+        st.caption(f"共 {total_groups} 個分組，{total_points} 筆數據")
+    else:
+        st.write("無分組資訊")
 
 # Dimension selection
 all_dimensions = sorted(raw["dimension"].dropna().unique().tolist())
