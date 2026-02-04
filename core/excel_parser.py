@@ -1,6 +1,7 @@
 """Excel parsing functions for dimension quality data."""
 
 from typing import Optional, Tuple
+import re
 
 import numpy as np
 import pandas as pd
@@ -32,6 +33,56 @@ def _clean_cell(value) -> str:
     return str(value).strip()
 
 
+def _clean_label(value) -> str:
+    """Normalize measurement label to a consistent string."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and np.isnan(value):
+        return ""
+    if isinstance(value, (int, float)) and float(value).is_integer():
+        return str(int(value))
+    text = str(value).strip()
+    try:
+        num = float(text)
+        if num.is_integer():
+            return str(int(num))
+    except Exception:
+        pass
+    return text
+
+
+def _parse_cavity_cycle_from_label(label: str) -> Tuple[Optional[int], Optional[int]]:
+    """Parse cavity/cycle from label like #1-3, 4-2, 8(4-2)."""
+    if not label:
+        return None, None
+    match = re.search(r"\((\d+)\s*[-_/]\s*(\d+)\)", label)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    match = re.search(r"#?\s*(\d+)\s*[-_/]\s*(\d+)", label)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    return None, None
+
+
+def _parse_cavity_from_mold_label(label: str) -> Optional[int]:
+    """Parse cavity from mold header like '#4穴'."""
+    if not label:
+        return None
+    match = re.search(r"#?\s*(\d+)\s*穴", label)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _parse_cycle_from_mold_label(label: str) -> Optional[int]:
+    """Parse cycle from mold header like '第一模'."""
+    if not label:
+        return None
+    match = re.search(r"第\s*(\d+)\s*模", label)
+    if match:
+        return int(match.group(1))
+    return None
+
 def _detect_focus_sheet(xl: pd.ExcelFile) -> Tuple[Optional[str], Optional[str]]:
     """Detect the sheet containing focus dimension data."""
     for name in xl.sheet_names:
@@ -51,8 +102,8 @@ def _detect_focus_sheet(xl: pd.ExcelFile) -> Tuple[Optional[str], Optional[str]]
 
 def _extract_mold_and_pos(
     df: pd.DataFrame, header_row: int, meas_cols: list
-) -> Tuple[dict, dict, dict]:
-    """Extract mold labels and position information from measurement columns."""
+) -> Tuple[dict, dict, dict, dict, dict, dict]:
+    """Extract mold labels, measurement labels, and position information."""
     header = df.iloc[header_row]
     # Mold labels are in the header row; forward-fill across measurement columns.
     mold_labels = {}
@@ -65,6 +116,9 @@ def _extract_mold_and_pos(
 
     # Position row is usually the next row under the header.
     pos_row = df.iloc[header_row + 1] if header_row + 1 < len(df) else None
+    meas_labels = {}
+    cavities = {}
+    cycles = {}
     pos_raw = {}
     pos_in_mold = {}
     mold_counts = {}
@@ -72,13 +126,23 @@ def _extract_mold_and_pos(
         raw_val = np.nan
         if pos_row is not None:
             raw_val = pd.to_numeric(pos_row.iloc[col], errors="coerce")
+        label = _clean_label(pos_row.iloc[col]) if pos_row is not None else ""
+        meas_labels[col] = label
+
+        cav, cyc = _parse_cavity_cycle_from_label(label)
+        if cav is None:
+            cav = _parse_cavity_from_mold_label(mold_labels.get(col, ""))
+        if cyc is None:
+            cyc = _parse_cycle_from_mold_label(mold_labels.get(col, ""))
+        cavities[col] = cav if cav is not None else np.nan
+        cycles[col] = cyc if cyc is not None else np.nan
         pos_raw[col] = raw_val
 
         mold = mold_labels.get(col, "")
         mold_counts[mold] = mold_counts.get(mold, 0) + 1
         pos_in_mold[col] = mold_counts[mold]
 
-    return mold_labels, pos_raw, pos_in_mold
+    return mold_labels, meas_labels, cavities, cycles, pos_raw, pos_in_mold
 
 
 def parse_focus_dimensions(df: pd.DataFrame) -> pd.DataFrame:
@@ -105,7 +169,9 @@ def parse_focus_dimensions(df: pd.DataFrame) -> pd.DataFrame:
     if not meas_cols:
         raise ValueError("找不到量測數值欄位")
 
-    mold_labels, pos_raw, pos_in_mold = _extract_mold_and_pos(df, header_row, meas_cols)
+    mold_labels, meas_labels, cavities, cycles, pos_raw, pos_in_mold = _extract_mold_and_pos(
+        df, header_row, meas_cols
+    )
 
     data = df.iloc[header_row + 2 :].copy()
 
@@ -168,6 +234,10 @@ def parse_focus_dimensions(df: pd.DataFrame) -> pd.DataFrame:
                     "upper": float(upper) if pd.notna(upper) else np.nan,
                     "lower": float(lower) if pd.notna(lower) else np.nan,
                     "mold": mold_labels.get(col, ""),
+                    "meas_label": meas_labels.get(col, ""),
+                    "pos_tag": meas_labels.get(col, ""),
+                    "cavity": float(cavities.get(col)) if pd.notna(cavities.get(col, np.nan)) else np.nan,
+                    "cycle": float(cycles.get(col)) if pd.notna(cycles.get(col, np.nan)) else np.nan,
                     "pos_raw": float(pos_raw.get(col)) if pd.notna(pos_raw.get(col, np.nan)) else np.nan,
                     "pos_in_mold": float(pos_in_mold.get(col)) if pd.notna(pos_in_mold.get(col, np.nan)) else np.nan,
                 }
