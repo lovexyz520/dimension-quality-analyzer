@@ -93,6 +93,14 @@ if not all_frames:
 
 raw = pd.concat(all_frames, ignore_index=True)
 
+# Calculate file list and mold counts early (needed for custom grouping UI)
+file_list = sorted(raw["file"].dropna().unique().tolist())
+file_mold_counts = {}
+for fname in file_list:
+    sub = raw[raw["file"] == fname]
+    molds = [m for m in sub.get("mold", pd.Series(dtype=str)).dropna().unique() if str(m).strip()]
+    file_mold_counts[fname] = len(molds)
+
 # Display mode selection
 mode = st.radio(
     "顯示模式",
@@ -101,16 +109,156 @@ mode = st.radio(
     horizontal=True,
 )
 
-# Calculate file mold counts
-file_list = sorted(raw["file"].dropna().unique().tolist())
-file_mold_counts = {}
-for fname in file_list:
-    sub = raw[raw["file"] == fname]
-    molds = [m for m in sub.get("mold", pd.Series(dtype=str)).dropna().unique() if str(m).strip()]
-    file_mold_counts[fname] = len(molds)
+# Custom grouping rules
+use_custom_grouping = st.checkbox("使用自訂分組規則", value=False)
+custom_groups = ""
+if use_custom_grouping:
+    # Show available files and tags for reference
+    with st.expander("查看可用的檔案與標籤", expanded=False):
+        for fname in file_list:
+            sub = raw[raw["file"] == fname]
+            tags = sub["pos_tag"].dropna().unique().tolist() if "pos_tag" in sub.columns else []
+            if tags:
+                st.write(f"**{fname}**: {', '.join(str(t) for t in sorted(tags)[:20])}")
+                if len(tags) > 20:
+                    st.caption(f"...還有 {len(tags) - 20} 個標籤")
+
+    custom_groups = st.text_area(
+        "自訂分組格式",
+        value="# 檔案1.xlsm\nP1: #1-1,#1-2,#1-3,#1-4,#1-5\nP2: #2-1,#2-2,#2-3,#2-4,#2-5\n\n# 檔案2.xlsm\nP5: #1-1,#1-2\nP6: #2-1,#2-2",
+        help="格式說明：\n"
+             "• 簡單格式：群組名稱: 標籤1,標籤2,...\n"
+             "• 按檔案分組：先用 # 檔案名稱 指定檔案，接著定義該檔案的分組規則\n"
+             "• 當多檔案有相同標籤時，請使用按檔案分組格式避免誤判",
+        height=200,
+    )
 
 # Assign groups using vectorized function
-raw["group"] = assign_groups_vectorized(raw, mode, file_mold_counts, file_list)
+def _apply_group_labels(base: pd.Series) -> pd.Series:
+    base = base.fillna("").astype(str)
+    if mode == "全部合併成一張圖":
+        return pd.Series("合併", index=raw.index)
+    if mode == "強制分檔顯示":
+        return (raw["file"].fillna("") + " " + base.replace("", "合併")).str.strip()
+    return base.replace("", "合併")
+
+
+def _parse_custom_groups(text: str) -> dict:
+    """Parse custom grouping rules with optional file-specific syntax.
+
+    Supports two formats:
+    1. Simple format (applies to all files):
+       P1: #1-1,#1-2,#1-3
+
+    2. File-specific format (use # filename to specify):
+       # 6.xlsm
+       P1: #1-1,#1-2,#1-3
+       # 8.xlsm
+       P5: #1-1,#1-2
+
+    Returns:
+        dict with keys as (filename, tag) tuples or just tag strings
+    """
+    mapping = {}
+    current_file = None
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        # Check for file header: # filename.xlsm or # filename.xlsx
+        if line.startswith("#") and ("." in line or line[1:].strip() in ["", " "]):
+            potential_file = line[1:].strip()
+            if potential_file and ("." in potential_file):
+                current_file = potential_file
+                continue
+
+        if ":" not in line:
+            continue
+
+        name, values = line.split(":", 1)
+        group_name = name.strip()
+        for token in values.split(","):
+            tag = token.strip()
+            if tag:
+                if current_file:
+                    # File-specific mapping: (filename, tag) -> group
+                    mapping[(current_file, tag)] = group_name
+                else:
+                    # Global mapping: tag -> group
+                    mapping[tag] = group_name
+
+    return mapping
+
+
+def _apply_custom_mapping(raw: pd.DataFrame, mapping: dict) -> pd.Series:
+    """Apply custom group mapping considering file-specific rules."""
+    result = pd.Series("其他", index=raw.index)
+
+    # Check if mapping has file-specific keys (tuples)
+    has_file_keys = any(isinstance(k, tuple) for k in mapping.keys())
+
+    if has_file_keys:
+        # File-specific mapping
+        for idx, row in raw.iterrows():
+            file_name = row.get("file", "")
+            tag = row.get("pos_tag", "")
+            if pd.isna(tag):
+                tag = ""
+
+            # Try file-specific key first
+            key = (file_name, str(tag))
+            if key in mapping:
+                result.loc[idx] = mapping[key]
+            # Fall back to global key
+            elif str(tag) in mapping:
+                result.loc[idx] = mapping[str(tag)]
+    else:
+        # Simple global mapping
+        result = raw["pos_tag"].map(mapping).fillna("其他")
+
+    return result
+
+
+if use_custom_grouping:
+    if "pos_tag" in raw.columns and raw["pos_tag"].notna().any():
+        mapping = _parse_custom_groups(custom_groups)
+        mapped = _apply_custom_mapping(raw, mapping)
+        raw["group"] = _apply_group_labels(mapped)
+    else:
+        st.warning("找不到量測欄位標籤，已改用自動分組。")
+        raw["group"] = assign_groups_vectorized(raw, mode, file_mold_counts, file_list)
+else:
+    base_group = pd.Series("", index=raw.index, dtype=str)
+    for fname in file_list:
+        sub = raw[raw["file"] == fname]
+        has_pos_tag = "pos_tag" in sub.columns and sub["pos_tag"].notna().any()
+        has_cavity = "cavity" in sub.columns and sub["cavity"].notna().any()
+        has_pos_in_mold = "pos_in_mold" in sub.columns and sub["pos_in_mold"].notna().any()
+        tag_has_cavity_cycle = False
+        if has_pos_tag:
+            tag_has_cavity_cycle = sub["pos_tag"].astype(str).str.contains(
+                r"#\s*\d+\s*[-/]\s*\d+|\d+\s*[-/]\s*\d+", regex=True
+            ).any()
+
+        if has_cavity and tag_has_cavity_cycle:
+            base_group.loc[sub.index] = sub["cavity"].apply(
+                lambda x: f"P{int(x)}" if pd.notna(x) else ""
+            )
+        elif has_cavity and sub["cavity"].dropna().nunique() == 1 and has_pos_tag:
+            only = sub["cavity"].dropna().unique().tolist()
+            p_label = f"P{int(only[0])}" if only else "P1"
+            base_group.loc[sub.index] = p_label
+        elif has_pos_in_mold:
+            base_group.loc[sub.index] = sub["pos_in_mold"].apply(
+                lambda x: f"P{int(x)}" if pd.notna(x) else ""
+            )
+        else:
+            fallback = assign_groups_vectorized(sub, mode, file_mold_counts, file_list)
+            base_group.loc[sub.index] = fallback
+
+    raw["group"] = _apply_group_labels(base_group)
 
 # Dimension selection
 all_dimensions = sorted(raw["dimension"].dropna().unique().tolist())
