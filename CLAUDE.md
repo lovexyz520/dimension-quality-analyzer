@@ -46,6 +46,8 @@ dimension-quality-analyzer/
 | `_find_col_index()` | 尋找指定標籤的欄位索引 |
 | `_clean_cell()` | 清理儲存格值 |
 | `_detect_focus_sheet()` | 自動偵測「重點尺寸」工作表 |
+| `_detect_arrangement_from_mold_labels()` | 偵測資料排列方式 (CAV.X / 第X模) |
+| `_parse_cavity_from_cav_label()` | 從 CAV.X 格式解析穴號 |
 | `_extract_mold_and_pos()` | 提取模次與位置資訊 |
 | `parse_focus_dimensions()` | 解析 Excel 數據為標準格式 |
 | `load_excel()` | Excel 檔案載入入口 |
@@ -105,8 +107,8 @@ dimension-quality-analyzer/
 
 ```
 Excel 上傳 → load_excel() → parse_focus_dimensions()
-    → DataFrame (dimension, value, nominal, upper, lower, mold, pos_in_mold)
-    → assign_groups_vectorized() → 分組
+    → DataFrame (dimension, value, nominal, upper, lower, mold, pos_in_mold, cavity, cycle, arrangement)
+    → 自動偵測 arrangement → 分組
     → 各分頁視覺化與統計
 ```
 
@@ -141,6 +143,45 @@ pip install -r requirements.txt
 - 支援多檔案合併或分檔比較模式
 - 顯示模式包含：自動分組、強制分檔顯示、全部合併成一張圖
 - 多模次檔案會依位置列自動分組成 P1..Pn
+
+## 自動偵測資料排列方式
+
+系統會根據 Excel 欄位標題自動偵測資料排列方式：
+
+| 欄位格式 | 偵測結果 | 分組方式 | 說明 |
+|----------|----------|----------|------|
+| `CAV.1`, `CAV.2`... | `cavity_first` | 按 `cavity` 分組 | 穴號優先：同穴不同模次 |
+| `第一模`, `第二模`... | `cycle_first` | 按 `pos_in_mold` 分組 | 模次優先：同模次不同穴號 |
+| `#1-1`, `#2-3`... | 原有邏輯 | 按 `cavity` 分組 | 從標籤解析穴號 |
+
+### 範例 (4穴3模次)
+
+**穴號優先 (CAV.X 格式)**：
+```
+P1: 1,2,3    ← CAV.1 的模次 1~3
+P2: 4,5,6    ← CAV.2 的模次 1~3
+P3: 7,8,9    ← CAV.3 的模次 1~3
+P4: 10,11,12 ← CAV.4 的模次 1~3
+```
+
+**模次優先 (第X模 格式)**：
+```
+P1: 1,5,9    ← 各模次的位置 1
+P2: 2,6,10   ← 各模次的位置 2
+P3: 3,7,11   ← 各模次的位置 3
+P4: 4,8,12   ← 各模次的位置 4
+```
+
+## 自訂分組功能
+
+### 各檔案獨立配置
+- 每個上傳的檔案可獨立設定排列方式、穴數、模次數
+- 支援預覽生成的分組規則
+- 多檔案時 P 編號自動遞增
+
+### 快速配置工具
+- 根據穴數/模次數參數快速生成分組規則
+- 支援「穴號優先」與「模次優先」兩種排列方式
 
 ## Cpk 評級標準
 
