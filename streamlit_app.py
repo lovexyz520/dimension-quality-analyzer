@@ -99,6 +99,59 @@ def _analyze_tag_structure(tags: list) -> dict:
     return result
 
 
+def _generate_cavity_cycle_grouping(
+    num_cavities: int,
+    num_cycles: int,
+    arrangement: str,
+    start_p: int = 1,
+    file_name: str = "",
+) -> str:
+    """Generate grouping rules based on cavity count, cycle count, and arrangement.
+
+    Args:
+        num_cavities: Number of cavities
+        num_cycles: Number of cycles/molds
+        arrangement: "cavity_first" (穴號優先) or "cycle_first" (模次優先)
+        start_p: Starting P number
+        file_name: Optional filename to include as header
+
+    Returns:
+        Grouping rules string
+
+    Examples:
+        cavity_first (4穴3模次): Labels are arranged as cavity1-cycle1,2,3, cavity2-cycle1,2,3...
+            P1: 1,2,3    ← cavity 1's cycles 1~3
+            P2: 4,5,6    ← cavity 2's cycles 1~3
+            P3: 7,8,9    ← cavity 3's cycles 1~3
+            P4: 10,11,12 ← cavity 4's cycles 1~3
+
+        cycle_first (4穴3模次): Labels are arranged as cycle1-cavity1,2,3,4, cycle2-cavity1,2,3,4...
+            P1: 1,5,9    ← cavity 1 in cycles 1,2,3
+            P2: 2,6,10   ← cavity 2 in cycles 1,2,3
+            P3: 3,7,11   ← cavity 3 in cycles 1,2,3
+            P4: 4,8,12   ← cavity 4 in cycles 1,2,3
+    """
+    lines = []
+
+    if file_name:
+        lines.append(f"# {file_name}")
+
+    for cavity in range(num_cavities):
+        p_num = start_p + cavity
+        if arrangement == "cavity_first":
+            # 穴號優先: labels 1,2,3 are cavity 1's cycles 1~3
+            # label = cavity * num_cycles + cycle + 1
+            tags = [cavity * num_cycles + cycle + 1 for cycle in range(num_cycles)]
+        else:
+            # 模次優先: labels 1,2,3,4 are cycle 1's cavities 1~4
+            # label = cycle * num_cavities + cavity + 1
+            tags = [cycle * num_cavities + cavity + 1 for cycle in range(num_cycles)]
+
+        lines.append(f"P{p_num}: {','.join(map(str, tags))}")
+
+    return "\n".join(lines)
+
+
 def _generate_grouping_suggestion(raw_df: pd.DataFrame, file_list: list, start_p: int = 1) -> str:
     """Generate smart grouping suggestion based on file structure.
 
@@ -254,14 +307,125 @@ if use_custom_grouping:
                 if len(tags) > 20:
                     st.caption(f"    ...還有 {len(tags) - 20} 個標籤")
 
-    # Smart grouping suggestion
-    col_suggest, col_start = st.columns([3, 1])
-    with col_start:
-        start_p_num = st.number_input("起始編號", min_value=1, value=1, step=1, help="P 編號從幾開始")
-    with col_suggest:
-        if st.button("🔮 智能分組建議", help="根據檔案結構自動生成分組規則"):
+    # Per-file configuration for cavity/cycle based grouping
+    st.markdown("---")
+    st.markdown("#### 各檔案獨立配置")
+    st.caption("針對每個檔案分別設定排列方式、穴數、模次數")
+
+    # Initialize session state for file configs if not exists
+    if "file_configs" not in st.session_state:
+        st.session_state["file_configs"] = {}
+
+    # Global starting P number
+    start_p_num = st.number_input(
+        "起始 P 編號",
+        min_value=1,
+        value=1,
+        step=1,
+        help="第一個檔案的 P 編號從幾開始，後續檔案會自動遞增"
+    )
+
+    # Configuration for each file
+    file_configs = {}
+    for i, fname in enumerate(file_list):
+        with st.expander(f"📁 {fname}", expanded=True):
+            # Get file's tag info
+            sub = raw[raw["file"] == fname]
+            tags = sub["pos_tag"].dropna().unique().tolist() if "pos_tag" in sub.columns else []
+            num_tags = len(tags)
+
+            # Try to detect format
+            analysis = _analyze_tag_structure(tags) if tags else {"format": "unknown"}
+            detected_format = analysis.get("format", "unknown")
+
+            # Show detected info
+            if detected_format == "cavity-cycle":
+                st.info(f"偵測到 #穴-模次 格式，共 {num_tags} 個標籤")
+            elif num_tags > 0:
+                st.info(f"偵測到 {num_tags} 個標籤: {', '.join(str(t) for t in sorted(tags)[:10])}{'...' if num_tags > 10 else ''}")
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                arr = st.radio(
+                    "排列方式",
+                    options=["穴號優先", "模次優先", "使用智能偵測"],
+                    index=2,
+                    key=f"arr_{fname}",
+                    help="穴號優先：1,2,3 是穴1的模次1~3\n模次優先：1,2,3,4 是模次1的穴1~4\n智能偵測：自動分析 #穴-模次 格式"
+                )
+            with col2:
+                # Try to auto-detect cavity count
+                default_cav = len(analysis.get("cavities", [])) if detected_format == "cavity-cycle" else 4
+                if default_cav == 0:
+                    default_cav = 4
+                cav = st.number_input(
+                    "穴數",
+                    min_value=1,
+                    max_value=50,
+                    value=default_cav,
+                    step=1,
+                    key=f"cav_{fname}"
+                )
+            with col3:
+                # Try to auto-detect cycle count
+                default_cyc = len(analysis.get("cycles", [])) if detected_format == "cavity-cycle" else 3
+                if default_cyc == 0:
+                    default_cyc = 3
+                cyc = st.number_input(
+                    "模次數",
+                    min_value=1,
+                    max_value=50,
+                    value=default_cyc,
+                    step=1,
+                    key=f"cyc_{fname}"
+                )
+
+            file_configs[fname] = {
+                "arrangement": arr,
+                "cavities": cav,
+                "cycles": cyc,
+                "tags": tags,
+                "analysis": analysis,
+            }
+
+    # Generate button
+    col_gen, col_smart = st.columns(2)
+    with col_gen:
+        if st.button("✅ 產生所有檔案的分組規則", help="根據各檔案的配置產生分組規則"):
+            parts = []
+            current_p = start_p_num
+
+            for fname in file_list:
+                cfg = file_configs[fname]
+
+                if cfg["arrangement"] == "使用智能偵測":
+                    # Use smart detection for #cavity-cycle format
+                    sub_df = raw[raw["file"] == fname]
+                    part = _generate_grouping_suggestion(sub_df, [fname], current_p)
+                    # Count groups generated
+                    num_groups = part.count("\nP") + (1 if part.startswith("P") or part.startswith("# ") else 0)
+                    # More accurate count
+                    num_groups = len([line for line in part.split("\n") if line.strip().startswith("P")])
+                else:
+                    arr_key = "cavity_first" if cfg["arrangement"] == "穴號優先" else "cycle_first"
+                    part = _generate_cavity_cycle_grouping(
+                        cfg["cavities"], cfg["cycles"], arr_key, current_p, fname
+                    )
+                    num_groups = cfg["cavities"]
+
+                parts.append(part)
+                current_p += num_groups
+
+            st.session_state["grouping_suggestion"] = "\n\n".join(parts)
+            st.success("已產生分組規則，請查看下方文字區域")
+
+    with col_smart:
+        if st.button("🔮 全部使用智能偵測", help="所有檔案都使用智能偵測（適用於 #穴-模次 格式標籤）"):
             suggestion = _generate_grouping_suggestion(raw, file_list, start_p_num)
             st.session_state["grouping_suggestion"] = suggestion
+            st.success("已產生分組規則，請查看下方文字區域")
+
+    st.markdown("---")
 
     # Use suggestion if available
     default_value = st.session_state.get(
@@ -276,7 +440,7 @@ if use_custom_grouping:
              "• 簡單格式：群組名稱: 標籤1,標籤2,...\n"
              "• 按檔案分組：先用 # 檔案名稱 指定檔案，接著定義該檔案的分組規則\n"
              "• 當多檔案有相同標籤時，請使用按檔案分組格式避免誤判\n"
-             "• 點擊「智能分組建議」可自動生成規則",
+             "• 使用上方「各檔案獨立配置」可針對不同檔案設定不同的分組方式",
         height=200,
     )
 
@@ -383,13 +547,30 @@ else:
         has_pos_tag = "pos_tag" in sub.columns and sub["pos_tag"].notna().any()
         has_cavity = "cavity" in sub.columns and sub["cavity"].notna().any()
         has_pos_in_mold = "pos_in_mold" in sub.columns and sub["pos_in_mold"].notna().any()
+        has_arrangement = "arrangement" in sub.columns and sub["arrangement"].notna().any()
         tag_has_cavity_cycle = False
         if has_pos_tag:
             tag_has_cavity_cycle = sub["pos_tag"].astype(str).str.contains(
                 r"#\s*\d+\s*[-/]\s*\d+|\d+\s*[-/]\s*\d+", regex=True
             ).any()
 
-        if has_cavity and tag_has_cavity_cycle:
+        # Get arrangement type for this file
+        file_arrangement = sub["arrangement"].iloc[0] if has_arrangement else "unknown"
+
+        if file_arrangement == "cavity_first" and has_cavity:
+            # CAV.X format (10.xlsm style): group by cavity number
+            # 穴號優先：CAV.1 下的標籤 1,2,3 都屬於 P1
+            base_group.loc[sub.index] = sub["cavity"].apply(
+                lambda x: f"P{int(x)}" if pd.notna(x) else ""
+            )
+        elif file_arrangement == "cycle_first" and has_pos_in_mold:
+            # 第X模 format (2.xlsm style): group by position within mold
+            # 模次優先：第一模的位置1、第二模的位置1、第三模的位置1 都屬於 P1
+            base_group.loc[sub.index] = sub["pos_in_mold"].apply(
+                lambda x: f"P{int(x)}" if pd.notna(x) else ""
+            )
+        elif has_cavity and tag_has_cavity_cycle:
+            # #穴-模次 format in pos_tag
             base_group.loc[sub.index] = sub["cavity"].apply(
                 lambda x: f"P{int(x)}" if pd.notna(x) else ""
             )

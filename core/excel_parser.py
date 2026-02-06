@@ -83,6 +83,53 @@ def _parse_cycle_from_mold_label(label: str) -> Optional[int]:
         return int(match.group(1))
     return None
 
+
+def _detect_arrangement_from_mold_labels(mold_labels: dict) -> str:
+    """Detect data arrangement type from mold labels.
+
+    Args:
+        mold_labels: Dict mapping column index to mold label string
+
+    Returns:
+        "cavity_first" - if labels contain CAV.X pattern (同穴不同模次)
+        "cycle_first" - if labels contain 第X模 pattern (同模次不同穴號)
+        "unknown" - if pattern cannot be determined
+    """
+    labels = set(mold_labels.values())
+
+    has_cav_pattern = False
+    has_cycle_pattern = False
+
+    for label in labels:
+        if not label:
+            continue
+        # Check for CAV.X, CAV X, Cav.X patterns (case insensitive)
+        if re.search(r"(?i)cav[\.\s]*\d+", label):
+            has_cav_pattern = True
+        # Check for 第X模 pattern
+        if re.search(r"第\s*\d+\s*模", label):
+            has_cycle_pattern = True
+
+    if has_cav_pattern and not has_cycle_pattern:
+        return "cavity_first"
+    elif has_cycle_pattern and not has_cav_pattern:
+        return "cycle_first"
+    elif has_cav_pattern and has_cycle_pattern:
+        # Both patterns present - default to cycle_first (original behavior)
+        return "cycle_first"
+    else:
+        return "unknown"
+
+
+def _parse_cavity_from_cav_label(label: str) -> Optional[int]:
+    """Parse cavity number from CAV.X pattern."""
+    if not label:
+        return None
+    match = re.search(r"(?i)cav[\.\s]*(\d+)", label)
+    if match:
+        return int(match.group(1))
+    return None
+
 def _detect_focus_sheet(xl: pd.ExcelFile) -> Tuple[Optional[str], Optional[str]]:
     """Detect the sheet containing focus dimension data."""
     for name in xl.sheet_names:
@@ -102,8 +149,13 @@ def _detect_focus_sheet(xl: pd.ExcelFile) -> Tuple[Optional[str], Optional[str]]
 
 def _extract_mold_and_pos(
     df: pd.DataFrame, header_row: int, meas_cols: list
-) -> Tuple[dict, dict, dict, dict, dict, dict]:
-    """Extract mold labels, measurement labels, and position information."""
+) -> Tuple[dict, dict, dict, dict, dict, dict, str]:
+    """Extract mold labels, measurement labels, and position information.
+
+    Returns:
+        Tuple of (mold_labels, meas_labels, cavities, cycles, pos_raw, pos_in_mold, arrangement)
+        arrangement is one of: "cavity_first", "cycle_first", "unknown"
+    """
     header = df.iloc[header_row]
     # Mold labels are in the header row; forward-fill across measurement columns.
     mold_labels = {}
@@ -113,6 +165,9 @@ def _extract_mold_and_pos(
         if label:
             current_label = label
         mold_labels[col] = current_label
+
+    # Detect arrangement type from mold labels
+    arrangement = _detect_arrangement_from_mold_labels(mold_labels)
 
     # Position row is usually the next row under the header.
     pos_row = df.iloc[header_row + 1] if header_row + 1 < len(df) else None
@@ -132,6 +187,9 @@ def _extract_mold_and_pos(
         cav, cyc = _parse_cavity_cycle_from_label(label)
         if cav is None:
             cav = _parse_cavity_from_mold_label(mold_labels.get(col, ""))
+        # Also try to parse cavity from CAV.X pattern
+        if cav is None:
+            cav = _parse_cavity_from_cav_label(mold_labels.get(col, ""))
         if cyc is None:
             cyc = _parse_cycle_from_mold_label(mold_labels.get(col, ""))
         cavities[col] = cav if cav is not None else np.nan
@@ -142,7 +200,7 @@ def _extract_mold_and_pos(
         mold_counts[mold] = mold_counts.get(mold, 0) + 1
         pos_in_mold[col] = mold_counts[mold]
 
-    return mold_labels, meas_labels, cavities, cycles, pos_raw, pos_in_mold
+    return mold_labels, meas_labels, cavities, cycles, pos_raw, pos_in_mold, arrangement
 
 
 def parse_focus_dimensions(df: pd.DataFrame) -> pd.DataFrame:
@@ -169,7 +227,7 @@ def parse_focus_dimensions(df: pd.DataFrame) -> pd.DataFrame:
     if not meas_cols:
         raise ValueError("找不到量測數值欄位")
 
-    mold_labels, meas_labels, cavities, cycles, pos_raw, pos_in_mold = _extract_mold_and_pos(
+    mold_labels, meas_labels, cavities, cycles, pos_raw, pos_in_mold, arrangement = _extract_mold_and_pos(
         df, header_row, meas_cols
     )
 
@@ -240,6 +298,7 @@ def parse_focus_dimensions(df: pd.DataFrame) -> pd.DataFrame:
                     "cycle": float(cycles.get(col)) if pd.notna(cycles.get(col, np.nan)) else np.nan,
                     "pos_raw": float(pos_raw.get(col)) if pd.notna(pos_raw.get(col, np.nan)) else np.nan,
                     "pos_in_mold": float(pos_in_mold.get(col)) if pd.notna(pos_in_mold.get(col, np.nan)) else np.nan,
+                    "arrangement": arrangement,
                 }
             )
 
