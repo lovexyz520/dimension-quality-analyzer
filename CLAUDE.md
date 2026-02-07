@@ -62,6 +62,8 @@ dimension-quality-analyzer/
 | `cpk_with_rating()` | Cpk 加上評級與顏色 |
 | `imr_spc_points()` | 計算 I-MR 控制圖數據 |
 | `calculate_normalized_deviation()` | 計算標準化偏離 |
+| `calculate_correlation_matrix()` | 計算維度間相關性矩陣 |
+| `get_high_correlation_pairs()` | 取得高相關維度對 |
 
 ### core/visualization.py
 | 函數 | 功能 |
@@ -75,6 +77,8 @@ dimension-quality-analyzer/
 | `build_normalized_deviation_chart()` | 建立標準化偏離圖 |
 | `build_position_comparison_chart()` | 建立模次比較圖 |
 | `build_imr_chart()` | 建立 I-MR SPC 控制圖 |
+| `build_correlation_heatmap()` | 建立相關性熱力圖 |
+| `build_correlation_scatter()` | 建立相關性散佈圖 |
 
 ### core/export.py
 | 函數 | 功能 |
@@ -102,6 +106,7 @@ dimension-quality-analyzer/
 3. **SPC 控制圖** - I-MR 控制圖（製程穩定性監控）
 4. **標準化偏離** - 標準化偏離圖（相對於規格公差的偏離百分比）
 5. **模次比較** - 多模次位置比較圖
+6. **相關性分析** - 維度間相關性矩陣與散佈圖
 
 ## 資料流
 
@@ -213,6 +218,30 @@ I-MR 控制圖用於監控製程穩定性：
   - LCL = 0
 
 失控點（超出控制限）以紅色圈點標記。
+
+## 相關性分析
+
+相關性分析用於找出不同維度之間的關聯：
+
+- **Pearson 相關係數**：衡量兩維度間的線性關係
+  - r > 0.7：強正相關（兩維度同時增減）
+  - r < -0.7：強負相關（一維度增加，另一維度減少）
+  - |r| < 0.3：弱相關（兩維度獨立變動）
+
+### 子分頁
+
+| 分頁 | 功能 |
+|------|------|
+| 📊 相關性矩陣 | 基本相關性熱力圖，可選擇資料範圍 |
+| 📁 按檔案比較 | 比較不同檔案的相關性差異 |
+| 🔧 按穴號比較 | 比較不同穴號/分組的相關性差異 |
+
+### 樣本配對邏輯
+
+系統依序使用以下欄位作為樣本識別：
+1. `pos_tag`（位置標籤）
+2. `mold`（模次）
+3. 維度內的行索引（fallback）
 
 ## 部署
 

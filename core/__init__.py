@@ -9,6 +9,8 @@ from .statistics import (
     cpk_with_rating,
     imr_spc_points,
     calculate_normalized_deviation,
+    calculate_correlation_matrix,
+    get_high_correlation_pairs,
 )
 from .visualization import (
     add_spec_lines,
@@ -20,6 +22,8 @@ from .visualization import (
     build_normalized_deviation_chart,
     build_position_comparison_chart,
     build_imr_chart,
+    build_correlation_heatmap,
+    build_correlation_scatter,
 )
 from .export import (
     download_plot_button,
@@ -44,6 +48,8 @@ __all__ = [
     "cpk_with_rating",
     "imr_spc_points",
     "calculate_normalized_deviation",
+    "calculate_correlation_matrix",
+    "get_high_correlation_pairs",
     # Visualization
     "add_spec_lines",
     "build_fig",
@@ -54,6 +60,8 @@ __all__ = [
     "build_normalized_deviation_chart",
     "build_position_comparison_chart",
     "build_imr_chart",
+    "build_correlation_heatmap",
+    "build_correlation_scatter",
     # Export
     "download_plot_button",
     "download_excel_button",

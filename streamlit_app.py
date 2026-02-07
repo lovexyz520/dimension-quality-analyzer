@@ -29,6 +29,8 @@ from core import (
     cpk_with_rating,
     imr_spc_points,
     calculate_normalized_deviation,
+    calculate_correlation_matrix,
+    get_high_correlation_pairs,
     add_spec_lines,
     build_fig,
     apply_y_range,
@@ -38,6 +40,8 @@ from core import (
     build_normalized_deviation_chart,
     build_position_comparison_chart,
     build_imr_chart,
+    build_correlation_heatmap,
+    build_correlation_scatter,
     download_plot_button,
     download_excel_button,
     download_stats_excel,
@@ -704,7 +708,7 @@ with col_dl4:
                 st.warning("無法產生圖表，請確認已安裝 kaleido")
 
 # Create tabbed interface
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["盒鬚圖", "Cpk 分析", "SPC 控制圖", "標準化偏離", "模次比較"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["盒鬚圖", "Cpk 分析", "SPC 控制圖", "標準化偏離", "模次比較", "相關性分析"])
 
 # Tab 1: Box-and-Whisker Plots (original functionality)
 with tab1:
@@ -1121,3 +1125,380 @@ with tab5:
                 )
     else:
         st.info("資料中未包含模次位置資訊 (pos_in_mold)，無法進行模次比較分析。")
+
+# Tab 6: Correlation Analysis
+with tab6:
+    st.subheader("相關性分析")
+
+    st.markdown("""
+    **說明：** 分析不同維度之間的相關性，找出連動的尺寸。
+    - **強正相關 (r > 0.7)**：兩維度同時增減，可能受同一製程因素影響
+    - **強負相關 (r < -0.7)**：一維度增加時另一維度減少
+    - **弱相關 (|r| < 0.3)**：兩維度獨立變動
+    """)
+
+    if len(all_dimensions) >= 2:
+        # Sub-tabs for different analysis modes
+        corr_tab1, corr_tab2, corr_tab3 = st.tabs(["📊 相關性矩陣", "📁 按檔案比較", "🔧 按穴號比較"])
+
+        # ============================================================
+        # Sub-tab 1: Basic Correlation Matrix
+        # ============================================================
+        with corr_tab1:
+            # Data source selection
+            col_source, col_threshold = st.columns([2, 2])
+            with col_source:
+                source_options = ["全部合併"] + file_list
+                selected_source = st.selectbox(
+                    "資料範圍",
+                    options=source_options,
+                    key="corr_source",
+                    help="選擇要分析的資料範圍"
+                )
+            with col_threshold:
+                corr_threshold = st.slider(
+                    "高相關閾值 |r| >=",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=0.5,
+                    step=0.1,
+                    key="corr_threshold",
+                )
+
+            # Filter data based on selection
+            if selected_source == "全部合併":
+                corr_data = raw
+            else:
+                corr_data = raw[raw["file"] == selected_source]
+
+            if len(corr_data) > 0:
+                corr_matrix, pivot_table = calculate_correlation_matrix(corr_data)
+
+                if not corr_matrix.empty and len(corr_matrix) >= 2:
+                    # Show metrics
+                    col_m1, col_m2, col_m3 = st.columns(3)
+                    with col_m1:
+                        st.metric("維度數量", len(corr_matrix.columns))
+                    with col_m2:
+                        st.metric("樣本數", len(pivot_table))
+                    with col_m3:
+                        high_pairs = get_high_correlation_pairs(corr_matrix, threshold=corr_threshold)
+                        st.metric("高相關對數", len(high_pairs))
+
+                    # Display correlation heatmap
+                    corr_fig = build_correlation_heatmap(corr_matrix, height=max(400, len(corr_matrix) * 25 + 100))
+                    st.plotly_chart(corr_fig, use_container_width=True)
+
+                    # High correlation pairs
+                    st.markdown("### 高相關維度對")
+                    high_corr_pairs = get_high_correlation_pairs(corr_matrix, threshold=corr_threshold)
+
+                    if not high_corr_pairs.empty:
+                        display_pairs = high_corr_pairs.copy()
+                        display_pairs["相關性"] = display_pairs["correlation"].apply(
+                            lambda x: f"{'🔴' if x > 0 else '🔵'} {x:.3f}"
+                        )
+                        display_pairs["強度"] = display_pairs["abs_correlation"].apply(
+                            lambda x: "強" if x >= 0.8 else "中"
+                        )
+                        display_pairs = display_pairs.rename(columns={"dim1": "維度 1", "dim2": "維度 2"})
+
+                        st.dataframe(
+                            display_pairs[["維度 1", "維度 2", "相關性", "強度"]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                        # Scatter plot
+                        st.markdown("### 散佈圖")
+                        pair_options = [
+                            f"{row['dim1']} vs {row['dim2']} (r={row['correlation']:.3f})"
+                            for _, row in high_corr_pairs.iterrows()
+                        ]
+                        selected_pair = st.selectbox("選擇維度對", options=pair_options, key="corr_pair_select")
+
+                        if selected_pair:
+                            pair_idx = pair_options.index(selected_pair)
+                            dim1 = high_corr_pairs.iloc[pair_idx]["dim1"]
+                            dim2 = high_corr_pairs.iloc[pair_idx]["dim2"]
+                            scatter_fig = build_correlation_scatter(pivot_table, dim1, dim2, chart_height)
+                            st.plotly_chart(scatter_fig, use_container_width=True)
+                    else:
+                        st.info(f"沒有找到相關係數絕對值 >= {corr_threshold} 的維度對")
+
+                    # Download buttons
+                    st.markdown("---")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        try:
+                            corr_img = corr_fig.to_image(format="png", scale=3)
+                            st.download_button(
+                                "下載熱力圖 (PNG)",
+                                data=corr_img,
+                                file_name="correlation_heatmap.png",
+                                mime="image/png",
+                                key="corr_png",
+                            )
+                        except Exception:
+                            st.caption("PNG 下載需要 kaleido")
+                    with col2:
+                        corr_buffer = io.BytesIO()
+                        with pd.ExcelWriter(corr_buffer, engine="openpyxl") as writer:
+                            corr_matrix.to_excel(writer, sheet_name="correlation_matrix")
+                            if not high_corr_pairs.empty:
+                                high_corr_pairs.to_excel(writer, index=False, sheet_name="high_correlation_pairs")
+                        st.download_button(
+                            "下載相關性資料 (Excel)",
+                            data=corr_buffer.getvalue(),
+                            file_name="correlation_analysis.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="corr_xlsx",
+                        )
+                else:
+                    st.warning("資料不足以計算相關性矩陣（需要至少 2 個維度）")
+            else:
+                st.warning("所選資料範圍沒有資料")
+
+        # ============================================================
+        # Sub-tab 2: Compare by File
+        # ============================================================
+        with corr_tab2:
+            st.markdown("**比較不同檔案之間的相關性差異**")
+            st.caption("若相關性在不同檔案間差異大，可能代表製程變異或條件不同")
+
+            if len(file_list) >= 2:
+                # Select dimension pair to compare
+                all_dims_sorted = sorted(all_dimensions)
+                col_d1, col_d2 = st.columns(2)
+                with col_d1:
+                    compare_dim1 = st.selectbox("維度 1", options=all_dims_sorted, key="file_cmp_dim1")
+                with col_d2:
+                    remaining_dims = [d for d in all_dims_sorted if d != compare_dim1]
+                    compare_dim2 = st.selectbox("維度 2", options=remaining_dims, key="file_cmp_dim2")
+
+                if compare_dim1 and compare_dim2:
+                    # Calculate correlation for each file
+                    file_corrs = []
+                    for fname in file_list:
+                        file_data = raw[raw["file"] == fname]
+                        try:
+                            corr_mat, pivot = calculate_correlation_matrix(file_data)
+                            if compare_dim1 in corr_mat.columns and compare_dim2 in corr_mat.columns:
+                                r = corr_mat.loc[compare_dim1, compare_dim2]
+                                n = len(pivot.dropna(subset=[compare_dim1, compare_dim2]))
+                                file_corrs.append({"檔案": fname, "相關係數": r, "樣本數": n})
+                        except Exception:
+                            pass
+
+                    if file_corrs:
+                        file_corr_df = pd.DataFrame(file_corrs)
+
+                        # Display as bar chart
+                        import plotly.express as px
+                        fig_compare = px.bar(
+                            file_corr_df,
+                            x="檔案",
+                            y="相關係數",
+                            color="相關係數",
+                            color_continuous_scale=["#2166ac", "#f7f7f7", "#b2182b"],
+                            range_color=[-1, 1],
+                            text="相關係數",
+                        )
+                        fig_compare.update_traces(texttemplate="%{text:.3f}", textposition="outside")
+                        fig_compare.update_layout(
+                            title=f"{compare_dim1} vs {compare_dim2} - 各檔案相關性比較",
+                            yaxis_range=[-1.2, 1.2],
+                            height=400,
+                            showlegend=False,
+                        )
+                        st.plotly_chart(fig_compare, use_container_width=True)
+
+                        # Show table
+                        st.dataframe(
+                            file_corr_df.style.format({"相關係數": "{:.3f}"}),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                        # Statistics
+                        corr_values = file_corr_df["相關係數"].dropna()
+                        if len(corr_values) >= 2:
+                            col_s1, col_s2, col_s3 = st.columns(3)
+                            with col_s1:
+                                st.metric("平均相關係數", f"{corr_values.mean():.3f}")
+                            with col_s2:
+                                st.metric("標準差", f"{corr_values.std():.3f}")
+                            with col_s3:
+                                diff = corr_values.max() - corr_values.min()
+                                st.metric("最大差異", f"{diff:.3f}",
+                                         delta="穩定" if diff < 0.2 else "有變異",
+                                         delta_color="normal" if diff < 0.2 else "inverse")
+                    else:
+                        st.warning("無法計算所選維度對的相關性")
+            else:
+                st.info("需要上傳至少 2 個檔案才能進行檔案間比較")
+
+        # ============================================================
+        # Sub-tab 3: Compare by Cavity/Position
+        # ============================================================
+        with corr_tab3:
+            st.markdown("**比較不同穴號/位置之間的相關性差異**")
+            st.caption("若相關性在不同穴號間差異大，可能代表特定模穴有問題")
+
+            # Check available grouping options
+            has_cavity_data = "cavity" in raw.columns and raw["cavity"].dropna().nunique() >= 2
+            has_pos_in_mold = "pos_in_mold" in raw.columns and raw["pos_in_mold"].dropna().nunique() >= 2
+
+            # Filter out merged groups for comparison
+            if "group" in raw.columns:
+                valid_groups = [g for g in raw["group"].unique() if g and "合併" not in str(g)]
+                has_group_data = len(valid_groups) >= 2
+            else:
+                has_group_data = False
+                valid_groups = []
+
+            # Show data status for debugging
+            with st.expander("📋 資料狀態", expanded=False):
+                col_info1, col_info2, col_info3 = st.columns(3)
+                with col_info1:
+                    if has_cavity_data:
+                        cavities = raw["cavity"].dropna().unique()
+                        st.success(f"穴號: {len(cavities)} 個 ({', '.join(map(lambda x: str(int(x)), sorted(cavities)[:5]))}{'...' if len(cavities) > 5 else ''})")
+                    else:
+                        st.warning("無穴號資訊")
+                with col_info2:
+                    if has_pos_in_mold:
+                        positions = raw["pos_in_mold"].dropna().unique()
+                        st.success(f"位置: {len(positions)} 個")
+                    else:
+                        st.warning("無位置資訊")
+                with col_info3:
+                    if has_group_data:
+                        st.success(f"分組: {len(valid_groups)} 個")
+                    else:
+                        st.warning("無有效分組")
+
+            if has_cavity_data or has_pos_in_mold or has_group_data:
+                # Let user choose grouping method
+                grouping_options = []
+                if has_cavity_data:
+                    grouping_options.append("按穴號 (cavity)")
+                if has_pos_in_mold:
+                    grouping_options.append("按位置 (pos_in_mold)")
+                if has_group_data:
+                    grouping_options.append("按分組 (group)")
+
+                selected_grouping = st.radio(
+                    "分組方式",
+                    options=grouping_options,
+                    horizontal=True,
+                    key="cavity_grouping_method"
+                )
+
+                # Determine grouping column based on selection
+                if "穴號" in selected_grouping:
+                    group_col = "cavity"
+                    group_label = "穴號"
+                    groups = sorted(raw["cavity"].dropna().unique().tolist())
+                    group_names = [f"穴{int(g)}" for g in groups]
+                elif "位置" in selected_grouping:
+                    group_col = "pos_in_mold"
+                    group_label = "位置"
+                    groups = sorted(raw["pos_in_mold"].dropna().unique().tolist())
+                    group_names = [f"P{int(g)}" for g in groups]
+                else:
+                    group_col = "group"
+                    group_label = "分組"
+                    groups = sorted(valid_groups)
+                    group_names = groups
+
+                # Select dimension pair to compare
+                all_dims_sorted = sorted(all_dimensions)
+                col_d1, col_d2 = st.columns(2)
+                with col_d1:
+                    cavity_dim1 = st.selectbox("維度 1", options=all_dims_sorted, key="cavity_cmp_dim1")
+                with col_d2:
+                    remaining_dims = [d for d in all_dims_sorted if d != cavity_dim1]
+                    cavity_dim2 = st.selectbox("維度 2", options=remaining_dims, key="cavity_cmp_dim2")
+
+                if cavity_dim1 and cavity_dim2:
+                    # Show selected groups info
+                    st.caption(f"將比較 {len(groups)} 個{group_label}: {', '.join(group_names[:10])}{'...' if len(group_names) > 10 else ''}")
+
+                    # Calculate correlation for each group
+                    group_corrs = []
+                    skipped_groups = []
+                    for g, gname in zip(groups, group_names):
+                        group_data = raw[raw[group_col] == g]
+                        try:
+                            corr_mat, pivot = calculate_correlation_matrix(group_data, min_samples=3)
+                            if cavity_dim1 in corr_mat.columns and cavity_dim2 in corr_mat.columns:
+                                r = corr_mat.loc[cavity_dim1, cavity_dim2]
+                                if pd.notna(r):
+                                    n = len(pivot.dropna(subset=[cavity_dim1, cavity_dim2]))
+                                    group_corrs.append({group_label: gname, "相關係數": r, "樣本數": n})
+                                else:
+                                    skipped_groups.append(f"{gname}(資料不足)")
+                            else:
+                                skipped_groups.append(f"{gname}(維度不存在)")
+                        except Exception as e:
+                            skipped_groups.append(f"{gname}(錯誤)")
+
+                    if skipped_groups:
+                        st.caption(f"⚠️ 跳過的分組: {', '.join(skipped_groups)}")
+
+                    if group_corrs:
+                        group_corr_df = pd.DataFrame(group_corrs)
+
+                        # Display as bar chart
+                        import plotly.express as px
+                        fig_cavity = px.bar(
+                            group_corr_df,
+                            x=group_label,
+                            y="相關係數",
+                            color="相關係數",
+                            color_continuous_scale=["#2166ac", "#f7f7f7", "#b2182b"],
+                            range_color=[-1, 1],
+                            text="相關係數",
+                        )
+                        fig_cavity.update_traces(texttemplate="%{text:.3f}", textposition="outside")
+                        fig_cavity.update_layout(
+                            title=f"{cavity_dim1} vs {cavity_dim2} - 各{group_label}相關性比較",
+                            yaxis_range=[-1.2, 1.2],
+                            height=400,
+                            showlegend=False,
+                        )
+                        st.plotly_chart(fig_cavity, use_container_width=True)
+
+                        # Show table
+                        st.dataframe(
+                            group_corr_df.style.format({"相關係數": "{:.3f}"}),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                        # Statistics
+                        corr_values = group_corr_df["相關係數"].dropna()
+                        if len(corr_values) >= 2:
+                            col_s1, col_s2, col_s3 = st.columns(3)
+                            with col_s1:
+                                st.metric("平均相關係數", f"{corr_values.mean():.3f}")
+                            with col_s2:
+                                st.metric("標準差", f"{corr_values.std():.3f}")
+                            with col_s3:
+                                diff = corr_values.max() - corr_values.min()
+                                st.metric("最大差異", f"{diff:.3f}",
+                                         delta="穩定" if diff < 0.2 else "有變異",
+                                         delta_color="normal" if diff < 0.2 else "inverse")
+                    else:
+                        st.warning(f"無法計算所選維度對的相關性。可能原因：\n"
+                                  f"- 每個{group_label}的配對樣本數不足（需要至少 3 個）\n"
+                                  f"- 所選維度在某些{group_label}中沒有資料")
+            else:
+                st.info("需要有穴號、位置或分組資訊才能進行比較\n\n"
+                       "可能的原因：\n"
+                       "- Excel 欄位標題沒有 CAV.X 或 第X模 格式\n"
+                       "- 標籤沒有 #穴-模次 格式\n"
+                       "- 顯示模式為「全部合併」")
+    else:
+        st.info("需要至少 2 個維度才能進行相關性分析")
