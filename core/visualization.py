@@ -509,3 +509,154 @@ def build_position_comparison_chart(
     )
 
     return fig
+
+
+def build_correlation_heatmap(
+    corr_matrix: pd.DataFrame, height: int = 600
+) -> go.Figure:
+    """Build correlation heatmap visualization.
+
+    Args:
+        corr_matrix: Correlation matrix from calculate_correlation_matrix()
+        height: Chart height in pixels
+
+    Returns:
+        Plotly figure with correlation heatmap
+    """
+    if corr_matrix.empty:
+        fig = go.Figure()
+        fig.update_layout(
+            title="相關性矩陣 (無資料)",
+            height=height,
+            font=dict(family=CJK_FONT),
+        )
+        return fig
+
+    # Create heatmap
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=corr_matrix.values,
+            x=corr_matrix.columns.tolist(),
+            y=corr_matrix.index.tolist(),
+            colorscale=[
+                [0.0, "#2166ac"],    # Strong negative - blue
+                [0.25, "#67a9cf"],   # Weak negative - light blue
+                [0.5, "#f7f7f7"],    # No correlation - white
+                [0.75, "#ef8a62"],   # Weak positive - light red
+                [1.0, "#b2182b"],    # Strong positive - red
+            ],
+            zmin=-1,
+            zmax=1,
+            text=[[f"{v:.2f}" if pd.notna(v) else "" for v in row] for row in corr_matrix.values],
+            texttemplate="%{text}",
+            textfont={"size": 10},
+            hovertemplate="維度1: %{y}<br>維度2: %{x}<br>相關係數: %{z:.3f}<extra></extra>",
+            colorbar=dict(
+                title="相關係數",
+                tickvals=[-1, -0.5, 0, 0.5, 1],
+                ticktext=["-1.0", "-0.5", "0", "0.5", "1.0"],
+            ),
+        )
+    )
+
+    fig.update_layout(
+        title="維度相關性矩陣",
+        xaxis_title="",
+        yaxis_title="",
+        height=height,
+        margin=dict(l=100, r=50, t=60, b=100),
+        font=dict(family=CJK_FONT),
+        xaxis=dict(tickangle=-45, side="bottom"),
+        yaxis=dict(autorange="reversed"),
+    )
+
+    return fig
+
+
+def build_correlation_scatter(
+    pivot_table: pd.DataFrame,
+    dim1: str,
+    dim2: str,
+    height: int = 400
+) -> go.Figure:
+    """Build scatter plot for two dimensions.
+
+    Args:
+        pivot_table: Wide-format data from calculate_correlation_matrix()
+        dim1: First dimension name
+        dim2: Second dimension name
+        height: Chart height in pixels
+
+    Returns:
+        Plotly figure with scatter plot and trendline
+    """
+    if dim1 not in pivot_table.columns or dim2 not in pivot_table.columns:
+        fig = go.Figure()
+        fig.update_layout(
+            title=f"{dim1} vs {dim2} (無資料)",
+            height=height,
+            font=dict(family=CJK_FONT),
+        )
+        return fig
+
+    # Get paired data
+    data = pivot_table[[dim1, dim2]].dropna()
+
+    if data.empty or len(data) < 3:
+        fig = go.Figure()
+        fig.update_layout(
+            title=f"{dim1} vs {dim2} (資料不足)",
+            height=height,
+            font=dict(family=CJK_FONT),
+        )
+        return fig
+
+    x = data[dim1]
+    y = data[dim2]
+
+    # Calculate correlation
+    corr = x.corr(y)
+
+    # Calculate trendline
+    z = np.polyfit(x, y, 1)
+    p = np.poly1d(z)
+    x_line = np.linspace(x.min(), x.max(), 100)
+    y_line = p(x_line)
+
+    fig = go.Figure()
+
+    # Add scatter points
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=y,
+            mode="markers",
+            marker=dict(size=8, color="blue", opacity=0.7),
+            name="量測點",
+            hovertemplate=f"{dim1}: %{{x:.4f}}<br>{dim2}: %{{y:.4f}}<extra></extra>",
+        )
+    )
+
+    # Add trendline
+    fig.add_trace(
+        go.Scatter(
+            x=x_line,
+            y=y_line,
+            mode="lines",
+            line=dict(color="red", width=2, dash="dash"),
+            name=f"趨勢線 (r={corr:.3f})",
+        )
+    )
+
+    fig.update_layout(
+        title=f"{dim1} vs {dim2} (r = {corr:.3f})",
+        xaxis_title=dim1,
+        yaxis_title=dim2,
+        height=height,
+        margin=dict(l=60, r=60, t=60, b=60),
+        font=dict(family=CJK_FONT),
+        showlegend=True,
+        legend=dict(x=0.02, y=0.98),
+    )
+
+    return fig
