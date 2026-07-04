@@ -144,7 +144,11 @@ def _detect_focus_sheet(xl: pd.ExcelFile) -> Tuple[Optional[str], Optional[str]]
         if _find_header_row(df) is not None:
             return name, None
 
-    return None, "找不到包含 '規格' 與 '球標' 的工作表"
+    sheets = "、".join(str(s) for s in xl.sheet_names)
+    return None, (
+        f"找不到含有「規格」與「球標」標題列的工作表（已檢查：{sheets}）。"
+        "請確認工作表名稱含「重點尺寸」，或標題列同時包含「規格」與「球標」欄位。"
+    )
 
 
 def _extract_mold_and_pos(
@@ -218,14 +222,20 @@ def parse_focus_dimensions(df: pd.DataFrame) -> pd.DataFrame:
     col_method = _find_col_index(header, "量測方式")
 
     if col_label is None:
-        raise ValueError("找不到 '球標' 欄位")
+        raise ValueError(
+            f"標題列（第 {header_row + 1} 列）找不到「球標」欄位，"
+            "請確認欄位名稱完全等於「球標」（不含多餘空格以外的文字）"
+        )
 
     if col_method is None:
         col_method = df.shape[1]
 
     meas_cols = [i for i in range(col_label + 1, col_method) if i < df.shape[1]]
     if not meas_cols:
-        raise ValueError("找不到量測數值欄位")
+        raise ValueError(
+            "找不到量測數值欄位：「球標」與「量測方式」欄位之間沒有任何欄位，"
+            "量測值應放在這兩欄之間"
+        )
 
     mold_labels, meas_labels, cavities, cycles, pos_raw, pos_in_mold, arrangement = _extract_mold_and_pos(
         df, header_row, meas_cols
@@ -315,7 +325,12 @@ def load_excel(uploaded_file) -> Tuple[pd.DataFrame, Optional[str]]:
         df = pd.read_excel(xl, sheet_name=sheet_name, header=None, engine="openpyxl")
         out = parse_focus_dimensions(df)
         if out.empty:
-            return out, "沒有解析到任何量測數值"
+            return out, (
+                f"工作表「{sheet_name}」已找到標題列，但沒有解析到任何量測數值。"
+                "請確認數據從標題列往下第 2 列開始，且量測值為數字格式"
+            )
         return out, None
-    except Exception as exc:
+    except ValueError as exc:
         return pd.DataFrame(), str(exc)
+    except Exception as exc:
+        return pd.DataFrame(), f"讀取失敗（{type(exc).__name__}）: {exc}"

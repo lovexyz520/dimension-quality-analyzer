@@ -2,6 +2,7 @@
 
 import base64
 import io
+import json
 import os
 import re
 import zipfile
@@ -24,6 +25,7 @@ except Exception:
 
 from core import (
     load_excel,
+    calc_out_of_spec,
     pick_spec_values,
     stats_table,
     cpk_with_rating,
@@ -31,7 +33,13 @@ from core import (
     calculate_normalized_deviation,
     calculate_correlation_matrix,
     get_high_correlation_pairs,
+    nelson_rules_for_dimension,
+    normality_test,
+    variance_decomposition,
+    diagnose_overview,
+    cavity_fingerprint_data,
     add_spec_lines,
+    add_spec_band,
     build_fig,
     apply_y_range,
     add_spec_edge_markers,
@@ -42,7 +50,20 @@ from core import (
     build_imr_chart,
     build_correlation_heatmap,
     build_correlation_scatter,
-    download_plot_button,
+    build_histogram,
+    build_cpk_trend,
+    build_cavity_fingerprint,
+    build_pareto_chart,
+    DEFAULT_GEMINI_MODEL,
+    AVAILABLE_GEMINI_MODELS,
+    STAGE_LABELS,
+    DEFAULT_STAGE,
+    STAGE_TRYOUT,
+    STAGE_MONITORING,
+    detect_systematic_bias,
+    build_analysis_payload,
+    format_payload_as_text,
+    generate_ai_report,
     download_excel_button,
     download_stats_excel,
     download_quality_reports,
@@ -50,6 +71,91 @@ from core import (
     download_pdf_report_button,
     assign_groups_vectorized,
 )
+
+# Plotly modebar 內建相機按鈕直接下載高解析 PNG（瀏覽器端轉檔，不經 kaleido）
+PLOTLY_CONFIG = {
+    "displaylogo": False,
+    "toImageButtonOptions": {"format": "png", "scale": 3},
+}
+
+
+# ============================================================================
+# Cached computation layer
+# Streamlit 每次互動都會重跑整個腳本；把解析與統計包進 cache_data，
+# 只有資料真正改變時才重算。
+# ============================================================================
+
+@st.cache_data(show_spinner=False)
+def _load_excel_cached(content: bytes, name: str):
+    return load_excel(io.BytesIO(content))
+
+
+@st.cache_data(show_spinner=False)
+def _stats_cached(df: pd.DataFrame) -> pd.DataFrame:
+    return stats_table(df)
+
+
+@st.cache_data(show_spinner=False)
+def _cpk_cached(df: pd.DataFrame) -> pd.DataFrame:
+    return cpk_with_rating(df)
+
+
+@st.cache_data(show_spinner=False)
+def _spc_cached(df: pd.DataFrame):
+    return imr_spc_points(df)
+
+
+@st.cache_data(show_spinner=False)
+def _deviation_cached(df: pd.DataFrame) -> pd.DataFrame:
+    return calculate_normalized_deviation(df)
+
+
+@st.cache_data(show_spinner=False)
+def _overview_cached(df: pd.DataFrame) -> pd.DataFrame:
+    return diagnose_overview(df)
+
+
+@st.cache_data(show_spinner=False)
+def _variance_cached(df: pd.DataFrame) -> pd.DataFrame:
+    return variance_decomposition(df)
+
+
+@st.cache_data(show_spinner=False)
+def _fingerprint_cached(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    return cavity_fingerprint_data(df, group_col)
+
+
+def lazy_png_download(fig, filename: str, key: str, label: str = "產生 PNG 圖檔") -> None:
+    """PNG 轉檔（kaleido）延後到使用者點擊時才執行，避免拖慢每次重跑。"""
+    if st.button(label, key=f"png_btn_{key}"):
+        try:
+            with st.spinner("正在轉檔..."):
+                img_bytes = fig.to_image(format="png", scale=3)
+            st.download_button(
+                "⬇️ 下載 PNG",
+                data=img_bytes,
+                file_name=filename,
+                mime="image/png",
+                key=f"png_dl_{key}",
+            )
+        except Exception:
+            st.caption("PNG 轉檔需要 kaleido，請確認已安裝")
+
+
+def _figs_to_png_bytes(figs: list, scale: int = 2) -> list:
+    """Convert (title, fig) list to (title, png_bytes), with progress bar."""
+    results = []
+    if not figs:
+        return results
+    prog = st.progress(0, text="正在轉檔 PNG...")
+    for i, (title, fig) in enumerate(figs):
+        try:
+            results.append((title, fig.to_image(format="png", scale=scale)))
+        except Exception:
+            pass
+        prog.progress((i + 1) / len(figs), text=f"正在轉檔 PNG... ({i + 1}/{len(figs)})")
+    prog.empty()
+    return results
 
 
 # ============================================================================
@@ -243,6 +349,16 @@ if not uploaded_files:
     st.info("請先上傳 Excel 檔案")
     st.stop()
 
+# Analysis stage — 決定整體解讀框架（不改變統計計算，只改變重點與報告語氣）
+analysis_stage = st.radio(
+    "分析情境",
+    options=STAGE_LABELS,
+    index=STAGE_LABELS.index(DEFAULT_STAGE),
+    horizontal=True,
+    help="試模：重點在偏移補正方向與穴間平衡，淡化 Cpk/SPC；"
+         "量產首件：確認符合規格與 Cpk；量產監控：重點在 SPC 穩定性與趨勢。",
+)
+
 # Chart settings
 chart_height = st.slider("圖表高度", min_value=360, max_value=900, value=520, step=20)
 focus_on_data = st.checkbox("放大顯示盒鬚圖（以數據為主）", value=True)
@@ -255,7 +371,7 @@ errors = []
 
 load_progress = st.progress(0, text="正在載入檔案...")
 for i, file in enumerate(uploaded_files):
-    df, err = load_excel(file)
+    df, err = _load_excel_cached(file.getvalue(), file.name)
     if err:
         errors.append(f"{file.name}: {err}")
         continue
@@ -320,12 +436,42 @@ if use_custom_grouping:
     if "file_configs" not in st.session_state:
         st.session_state["file_configs"] = {}
 
+    # Import previously saved grouping config (JSON)
+    cfg_file = st.file_uploader(
+        "匯入分組設定 (JSON)",
+        type=["json"],
+        key="grouping_cfg_upload",
+        help="套用先前匯出的分組設定，下次上傳同格式檔案不必重設",
+    )
+    if cfg_file is not None:
+        cfg_sig = f"{cfg_file.name}_{cfg_file.size}"
+        if st.session_state.get("_grouping_cfg_applied") != cfg_sig:
+            try:
+                cfg = json.loads(cfg_file.getvalue().decode("utf-8"))
+                if "start_p" in cfg:
+                    st.session_state["start_p_num"] = int(cfg["start_p"])
+                for cfg_fname, fc in cfg.get("files", {}).items():
+                    if cfg_fname in file_list:
+                        if fc.get("arrangement") in ["穴號優先", "模次優先", "使用智能偵測"]:
+                            st.session_state[f"arr_{cfg_fname}"] = fc["arrangement"]
+                        if "cavities" in fc:
+                            st.session_state[f"cav_{cfg_fname}"] = int(fc["cavities"])
+                        if "cycles" in fc:
+                            st.session_state[f"cyc_{cfg_fname}"] = int(fc["cycles"])
+                if cfg.get("grouping_rules"):
+                    st.session_state["grouping_suggestion"] = cfg["grouping_rules"]
+                st.session_state["_grouping_cfg_applied"] = cfg_sig
+                st.success("已套用分組設定")
+            except Exception as exc:
+                st.error(f"設定檔格式錯誤: {exc}")
+
     # Global starting P number
     start_p_num = st.number_input(
         "起始 P 編號",
         min_value=1,
         value=1,
         step=1,
+        key="start_p_num",
         help="第一個檔案的 P 編號從幾開始，後續檔案會自動遞增"
     )
 
@@ -446,6 +592,27 @@ if use_custom_grouping:
              "• 當多檔案有相同標籤時，請使用按檔案分組格式避免誤判\n"
              "• 使用上方「各檔案獨立配置」可針對不同檔案設定不同的分組方式",
         height=200,
+    )
+
+    # Export current grouping config for reuse next time
+    export_cfg = {
+        "start_p": int(start_p_num),
+        "files": {
+            fname: {
+                "arrangement": cfg["arrangement"],
+                "cavities": int(cfg["cavities"]),
+                "cycles": int(cfg["cycles"]),
+            }
+            for fname, cfg in file_configs.items()
+        },
+        "grouping_rules": custom_groups,
+    }
+    st.download_button(
+        "💾 匯出分組設定 (JSON)",
+        data=json.dumps(export_cfg, ensure_ascii=False, indent=2).encode("utf-8"),
+        file_name="grouping_config.json",
+        mime="application/json",
+        help="儲存目前的排列方式、穴數、模次數與分組規則，下次可直接匯入",
     )
 
 # Assign groups using vectorized function
@@ -638,28 +805,73 @@ with st.expander("📋 查看分組詳情", expanded=False):
 # Dimension selection
 all_dimensions = sorted(raw["dimension"].dropna().unique().tolist())
 
+# Pre-compute statistics once (cached) — shared by all tabs below
+stats = _stats_cached(raw)
+cpk_df = _cpk_cached(raw)
+overview_df = _overview_cached(raw)
+
 search_text = st.text_input("維度搜尋", value="", placeholder="例如：1-A, 2-B, 2/A1")
+filtered_dimensions = all_dimensions
 if search_text:
     tokens = [t.strip().lower() for t in search_text.replace(";", ",").split(",") if t.strip()]
     if tokens:
-        all_dimensions = [d for d in all_dimensions if any(t in d.lower() for t in tokens)]
+        filtered_dimensions = [d for d in all_dimensions if any(t in d.lower() for t in tokens)]
+
+# Quick selection buttons for the dimension multiselect
+_ms_key = "dim_multiselect"
+
+
+def _set_dim_selection(dims):
+    st.session_state[_ms_key] = dims
+
+
+_oos_dims = stats.loc[stats["out_of_spec"] > 0, "dimension"].tolist()
+_bad_cpk_dims = (
+    cpk_df.loc[cpk_df["Cpk"] < 1.33, "dimension"].tolist() if not cpk_df.empty else []
+)
+
+qc1, qc2, qc3, qc4 = st.columns(4)
+with qc1:
+    st.button("全選", on_click=_set_dim_selection, args=(filtered_dimensions,), use_container_width=True)
+with qc2:
+    st.button("清空", on_click=_set_dim_selection, args=([],), use_container_width=True)
+with qc3:
+    st.button(
+        f"只選超規格 ({len(_oos_dims)})",
+        on_click=_set_dim_selection,
+        args=([d for d in _oos_dims if d in filtered_dimensions],),
+        use_container_width=True,
+        disabled=not _oos_dims,
+    )
+with qc4:
+    st.button(
+        f"只選 Cpk < 1.33 ({len(_bad_cpk_dims)})",
+        on_click=_set_dim_selection,
+        args=([d for d in _bad_cpk_dims if d in filtered_dimensions],),
+        use_container_width=True,
+        disabled=not _bad_cpk_dims,
+    )
+
+if _ms_key not in st.session_state:
+    st.session_state[_ms_key] = filtered_dimensions
+else:
+    st.session_state[_ms_key] = [
+        d for d in st.session_state[_ms_key] if d in filtered_dimensions
+    ]
 
 selected_dimensions = st.multiselect(
     "選擇要顯示的維度 (預設全選)",
-    options=all_dimensions,
-    default=all_dimensions,
+    options=filtered_dimensions,
+    key=_ms_key,
 )
 
 max_charts = st.number_input(
     "最多顯示幾張圖 (避免一次渲染太多)",
     min_value=1,
-    max_value=max(1, len(all_dimensions)),
-    value=min(20, max(1, len(all_dimensions))),
+    max_value=max(1, len(filtered_dimensions)),
+    value=min(20, max(1, len(filtered_dimensions))),
     step=1,
 )
-
-# Calculate statistics
-stats = stats_table(raw)
 
 # Download buttons
 col_dl1, col_dl2, col_dl3, col_dl4 = st.columns(4)
@@ -678,7 +890,6 @@ with col_dl4:
     # Generate PDF report with all charts
     if st.button("產生完整 PDF 報表", key="gen_pdf"):
         with st.spinner("正在產生 PDF 報表..."):
-            cpk_df = cpk_with_rating(raw)
             pdf_figures = []
 
             # Generate charts for PDF
@@ -691,6 +902,7 @@ with col_dl4:
                     continue
                 nominal, upper, lower, _ = pick_spec_values(sub)
                 fig = build_fig(sub, dim, 400)
+                add_spec_band(fig, lower, upper)
                 add_spec_lines(fig, nominal, upper, lower)
                 add_out_of_spec_points(fig, sub, lower, upper)
                 try:
@@ -708,17 +920,138 @@ with col_dl4:
                 st.warning("無法產生圖表，請確認已安裝 kaleido")
 
 # Create tabbed interface
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["盒鬚圖", "Cpk 分析", "SPC 控制圖", "標準化偏離", "模次比較", "相關性分析"])
+tab_overview, tab1, tab2, tab3, tab4, tab5, tab6, tab_detail, tab_ai = st.tabs(
+    ["📌 診斷總覽", "盒鬚圖", "Cpk 分析", "SPC 控制圖", "標準化偏離", "模次比較", "相關性分析", "🔍 維度詳情", "🤖 AI 報告"]
+)
+
+# Tab 0: Diagnostic Overview — 一眼看出哪些維度最需要關注
+with tab_overview:
+    st.subheader("📌 診斷總覽")
+    st.caption(f"目前分析情境：**{analysis_stage}**。彙整 Cpk、超規格、SPC 異常與常態性，依嚴重度排序。細節請到「🔍 維度詳情」分頁。")
+
+    # Stage-aware guidance banner
+    if analysis_stage == STAGE_TRYOUT:
+        bias = detect_systematic_bias(raw)
+        st.info(
+            "🔧 **試模模式**：此階段尺寸偏移屬正常，重點是決定修模與調機方向。"
+            "請以『偏移方向與量』『穴間平衡』為主，Cpk / SPC / 常態性此時僅供參考、不作良不良判定。"
+        )
+        if bias.get("message"):
+            if bias.get("dominant") and bias["dominant_pct"] >= 50:
+                st.warning(f"📐 偏移研判：{bias['message']}")
+            else:
+                st.caption(f"📐 偏移研判：{bias['message']}")
+        st.caption("💡 建議到「模次比較」分頁用『按位置』跑穴號指紋圖，判斷是全穴同偏（調製程）還是某穴獨偏（修該穴模仁）。")
+    elif analysis_stage == STAGE_MONITORING:
+        st.info(
+            "📈 **量產監控模式**：重點在製程穩定性。請優先看 SPC 控制圖的 Nelson 異常模式與跨批 Cpk 趨勢，"
+            "偏移與異常點視為製程漂移警訊。"
+        )
+
+    if overview_df.empty:
+        st.info("無可分析的資料")
+    else:
+        n_total = len(overview_df)
+        n_bad = int((overview_df["rating"] == "不良").sum())
+        n_ok = int((overview_df["rating"] == "可接受").sum())
+        n_oos_points = int(overview_df["out_of_spec"].sum())
+        n_nelson_dims = int((overview_df["nelson_count"] > 0).sum())
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        with m1:
+            st.metric("維度總數", n_total)
+        with m2:
+            st.metric("Cpk 不良 (<1.0)", n_bad, delta=None if n_bad == 0 else f"{n_bad} 個需處理", delta_color="inverse")
+        with m3:
+            st.metric("Cpk 可接受 (1.0~1.33)", n_ok)
+        with m4:
+            st.metric("超規格點總數", n_oos_points)
+        with m5:
+            st.metric("SPC 異常維度數", n_nelson_dims)
+
+        attention = overview_df[overview_df["priority"] > 0]
+        if attention.empty:
+            st.success("🎉 所有維度狀態良好：Cpk 達標、無超規格點、無 SPC 異常模式")
+        else:
+            st.markdown("### ⚠️ 需要關注的維度（依嚴重度排序）")
+
+            disp = attention.copy()
+            disp["常態性"] = disp["is_normal"].map(
+                {True: "常態", False: "⚠️ 非常態", None: "—"}
+            )
+            disp = disp[[
+                "dimension", "count", "Cpk", "rating", "out_of_spec",
+                "nelson_count", "nelson_rules", "常態性", "suggestion",
+            ]]
+            disp.columns = [
+                "維度", "樣本數", "Cpk", "評級", "超規格點",
+                "SPC 異常點", "違反規則", "常態性", "調機建議",
+            ]
+
+            def _color_rating(val):
+                if val == "良好":
+                    return "background-color: #2ecc71; color: white"
+                if val == "可接受":
+                    return "background-color: #f1c40f; color: black"
+                if val == "不良":
+                    return "background-color: #e74c3c; color: white"
+                return ""
+
+            styled = disp.style.applymap(_color_rating, subset=["評級"])
+            styled = styled.format({"Cpk": "{:.3f}"}, na_rep="N/A")
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+
+            st.caption(
+                "說明：SPC 異常點為違反 Nelson 規則（R1 超出 3σ、R2 連續 9 點同側、"
+                "R3 連續 6 點趨勢、R5 2/3 點超出 2σ）的點數；"
+                "非常態分布時 Cpk 數值僅供參考；樣本數 < 25 時 Cpk 估計不確定性大。"
+            )
+
+            # Pareto chart: 依「先解決影響最大的少數」原則決定處理優先序
+            st.markdown("### 📊 Pareto 排列圖（處理優先序）")
+            pareto_metric = st.radio(
+                "排序依據",
+                options=["超規格點數", "SPC 異常點數"],
+                horizontal=True,
+                key="pareto_metric",
+            )
+            metric_col = "out_of_spec" if pareto_metric == "超規格點數" else "nelson_count"
+            pareto_fig = build_pareto_chart(
+                overview_df,
+                label_col="dimension",
+                value_col=metric_col,
+                title=f"各維度{pareto_metric} — Pareto 排列圖",
+                height=chart_height,
+            )
+            st.plotly_chart(pareto_fig, use_container_width=True, config=PLOTLY_CONFIG)
+            st.caption("長條為各維度的異常數量（由大到小），折線為累積百分比；落在 80% 線以左的少數維度通常貢獻大部分問題，建議優先處理。")
+            lazy_png_download(pareto_fig, "pareto.png", key="pareto_overview")
+
+        with st.expander("查看全部維度", expanded=False):
+            full_disp = overview_df.copy()
+            full_disp["常態性"] = full_disp["is_normal"].map(
+                {True: "常態", False: "非常態", None: "—"}
+            )
+            full_disp = full_disp[[
+                "dimension", "count", "Cpk", "rating", "out_of_spec", "nelson_count", "常態性",
+            ]]
+            full_disp.columns = ["維度", "樣本數", "Cpk", "評級", "超規格點", "SPC 異常點", "常態性"]
+            st.dataframe(
+                full_disp.style.format({"Cpk": "{:.3f}"}, na_rep="N/A"),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 # Tab 1: Box-and-Whisker Plots (original functionality)
 with tab1:
     st.subheader("盒鬚圖")
+    st.caption("💡 圖表右上角的相機圖示可直接下載單張高解析 PNG（瀏覽器端轉檔，即時完成）")
 
     total_charts = min(len(selected_dimensions), max_charts)
     if total_charts > 0:
         progress = st.progress(0, text="正在生成圖表...")
         shown = 0
-        fig_cache = []
+        fig_cache = []  # (title, fig) — PNG 轉檔延後到匯出按鈕才執行
 
         for i, dim in enumerate(selected_dimensions):
             if shown >= max_charts:
@@ -732,43 +1065,30 @@ with tab1:
             if dual_view:
                 st.markdown("**完整規格視圖**")
                 fig_full = build_fig(sub, dim, chart_height)
+                add_spec_band(fig_full, lower, upper)
                 add_spec_lines(fig_full, nominal, upper, lower)
                 add_out_of_spec_points(fig_full, sub, lower, upper)
                 if auto_range:
                     apply_y_range(fig_full, sub, lower, upper, False)
-                st.plotly_chart(fig_full, use_container_width=True)
+                st.plotly_chart(fig_full, use_container_width=True, config=PLOTLY_CONFIG)
 
                 st.markdown("**放大視圖**")
                 fig_zoom = build_fig(sub, dim, chart_height)
+                add_spec_band(fig_zoom, lower, upper)
                 add_spec_lines(fig_zoom, nominal, upper, lower)
                 add_out_of_spec_points(fig_zoom, sub, lower, upper)
                 if auto_range:
                     y_min, y_max = apply_y_range(fig_zoom, sub, lower, upper, True)
                     add_spec_edge_markers(fig_zoom, lower, upper, y_min, y_max)
-                st.plotly_chart(fig_zoom, use_container_width=True)
+                st.plotly_chart(fig_zoom, use_container_width=True, config=PLOTLY_CONFIG)
 
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    download_plot_button(fig_full, f"{dim}_full.png")
-                with c2:
-                    download_plot_button(fig_zoom, f"{dim}_zoom.png")
-                with c3:
-                    download_excel_button(sub, f"{dim}.xlsx")
-                with c4:
-                    st.caption("")
+                download_excel_button(sub, f"{dim}.xlsx")
 
-                try:
-                    img_bytes = fig_full.to_image(format="png", scale=2)
-                    fig_cache.append((f"{dim} (full)", base64.b64encode(img_bytes).decode("ascii"), img_bytes))
-                except Exception:
-                    pass
-                try:
-                    img_bytes = fig_zoom.to_image(format="png", scale=2)
-                    fig_cache.append((f"{dim} (zoom)", base64.b64encode(img_bytes).decode("ascii"), img_bytes))
-                except Exception:
-                    pass
+                fig_cache.append((f"{dim} (full)", fig_full))
+                fig_cache.append((f"{dim} (zoom)", fig_zoom))
             else:
                 fig = build_fig(sub, dim, chart_height)
+                add_spec_band(fig, lower, upper)
                 add_spec_lines(fig, nominal, upper, lower)
                 add_out_of_spec_points(fig, sub, lower, upper)
                 if auto_range:
@@ -776,19 +1096,11 @@ with tab1:
                     if focus_on_data:
                         add_spec_edge_markers(fig, lower, upper, y_min, y_max)
 
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
 
-                col_left, col_right = st.columns(2)
-                with col_left:
-                    download_plot_button(fig, f"{dim}.png")
-                with col_right:
-                    download_excel_button(sub, f"{dim}.xlsx")
+                download_excel_button(sub, f"{dim}.xlsx")
 
-                try:
-                    img_bytes = fig.to_image(format="png", scale=2)
-                    fig_cache.append((dim, base64.b64encode(img_bytes).decode("ascii"), img_bytes))
-                except Exception:
-                    pass
+                fig_cache.append((dim, fig))
 
             if spec_versions > 1:
                 st.caption("注意：此維度在不同檔案中規格不一致，已取第一筆規格作為標示。")
@@ -802,29 +1114,43 @@ with tab1:
             st.info("目前選擇的維度沒有可用資料")
 
         if fig_cache:
-            if st.button("產生圖表 ZIP", key="zip_boxplot"):
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for title, _b64, img_bytes in fig_cache:
-                        zf.writestr(f"{title}.png", img_bytes)
-                    zf.writestr("summary.csv", stats.to_csv(index=False))
-                    zf.writestr("long_table.csv", raw.to_csv(index=False))
-                st.download_button(
-                    "下載全部圖表 ZIP",
-                    data=zip_buffer.getvalue(),
-                    file_name="boxplot_charts.zip",
-                    mime="application/zip",
-                )
-
-            if st.button("產生報表 (HTML)", key="html_boxplot"):
-                figures = [(title, b64) for title, b64, _bytes in fig_cache]
-                report_html = build_report_html(stats, figures)
-                st.download_button(
-                    "下載報表 (HTML)",
-                    data=report_html.encode("utf-8"),
-                    file_name="boxplot_report.html",
-                    mime="text/html",
-                )
+            st.markdown("---")
+            col_zip, col_html = st.columns(2)
+            with col_zip:
+                if st.button("產生圖表 ZIP", key="zip_boxplot"):
+                    png_list = _figs_to_png_bytes(fig_cache)
+                    if png_list:
+                        zip_buffer = io.BytesIO()
+                        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                            for title, img_bytes in png_list:
+                                zf.writestr(f"{title}.png", img_bytes)
+                            zf.writestr("summary.csv", stats.to_csv(index=False))
+                            zf.writestr("long_table.csv", raw.to_csv(index=False))
+                        st.download_button(
+                            "⬇️ 下載全部圖表 ZIP",
+                            data=zip_buffer.getvalue(),
+                            file_name="boxplot_charts.zip",
+                            mime="application/zip",
+                        )
+                    else:
+                        st.warning("PNG 轉檔失敗，請確認已安裝 kaleido")
+            with col_html:
+                if st.button("產生報表 (HTML)", key="html_boxplot"):
+                    png_list = _figs_to_png_bytes(fig_cache)
+                    if png_list:
+                        figures = [
+                            (title, base64.b64encode(img_bytes).decode("ascii"))
+                            for title, img_bytes in png_list
+                        ]
+                        report_html = build_report_html(stats, figures)
+                        st.download_button(
+                            "⬇️ 下載報表 (HTML)",
+                            data=report_html.encode("utf-8"),
+                            file_name="boxplot_report.html",
+                            mime="text/html",
+                        )
+                    else:
+                        st.warning("PNG 轉檔失敗，請確認已安裝 kaleido")
     else:
         st.info("請選擇至少一個維度")
 
@@ -832,13 +1158,10 @@ with tab1:
 with tab2:
     st.subheader("Cpk 分析")
 
-    # Calculate Cpk with ratings
-    cpk_df = cpk_with_rating(raw)
-
     if not cpk_df.empty:
         # Show Cpk heatmap
         cpk_fig = build_cpk_heatmap(cpk_df, height=chart_height)
-        st.plotly_chart(cpk_fig, use_container_width=True)
+        st.plotly_chart(cpk_fig, use_container_width=True, config=PLOTLY_CONFIG)
 
         # Show Cpk table with colored ratings
         st.markdown("### Cpk 評級表")
@@ -850,9 +1173,16 @@ with tab2:
         | < 1.0 | 不良 | 🔴 紅色 |
         """)
 
-        # Format and display table
-        display_df = cpk_df[["dimension", "count", "mean", "std", "USL", "LSL", "Cp", "Cpk", "rating"]].copy()
-        display_df.columns = ["維度", "數量", "平均值", "標準差", "上限", "下限", "Cp", "Cpk", "評級"]
+        # Format and display table (with Cpk confidence interval + sample warning)
+        display_df = cpk_df[["dimension", "count", "mean", "std", "USL", "LSL", "Cp", "Cpk"]].copy()
+        display_df["Cpk 95% CI"] = cpk_df.apply(
+            lambda r: f"[{r['Cpk_LCI']:.2f}, {r['Cpk_UCI']:.2f}]"
+            if pd.notna(r.get("Cpk_LCI")) else "N/A",
+            axis=1,
+        )
+        display_df["評級"] = cpk_df["rating"]
+        display_df["樣本警告"] = cpk_df["low_sample"].map({True: "⚠️ n<25", False: ""})
+        display_df.columns = ["維度", "數量", "平均值", "標準差", "上限", "下限", "Cp", "Cpk", "Cpk 95% CI", "評級", "樣本警告"]
 
         # Style the dataframe
         def color_rating(val):
@@ -875,20 +1205,34 @@ with tab2:
         }, na_rep="N/A")
 
         st.dataframe(styled_df, use_container_width=True)
+        st.caption(
+            "Cpk 95% CI 為信賴區間：樣本數少時區間很寬，代表 Cpk 點估計不可靠，"
+            "判定良莠時建議看區間下限而非點估計。"
+        )
+
+        # Cross-file Cpk trend (multi-file = time order comparison)
+        if len(file_list) >= 2:
+            with st.expander("📈 跨檔案 Cpk 趨勢（依上傳順序，可用於批次/改模前後比較）", expanded=False):
+                upload_order = list(dict.fromkeys(f.name for f in uploaded_files))
+                trend_rows = []
+                for fname in upload_order:
+                    file_cpk = _cpk_cached(raw[raw["file"] == fname])
+                    for _, r in file_cpk.iterrows():
+                        trend_rows.append(
+                            {"file": fname, "dimension": r["dimension"], "Cpk": r["Cpk"]}
+                        )
+                trend_df = pd.DataFrame(trend_rows).dropna(subset=["Cpk"])
+                if not trend_df.empty:
+                    trend_fig = build_cpk_trend(trend_df, height=chart_height)
+                    st.plotly_chart(trend_fig, use_container_width=True, config=PLOTLY_CONFIG)
+                    st.caption("點選圖例可隱藏/顯示個別維度")
+                else:
+                    st.info("各檔案皆無法計算 Cpk")
 
         # Download button for Cpk report
         col1, col2 = st.columns(2)
         with col1:
-            try:
-                cpk_img = cpk_fig.to_image(format="png", scale=3)
-                st.download_button(
-                    "下載 Cpk 圖表 (PNG)",
-                    data=cpk_img,
-                    file_name="cpk_analysis.png",
-                    mime="image/png",
-                )
-            except Exception:
-                st.caption("PNG 下載需要 kaleido")
+            lazy_png_download(cpk_fig, "cpk_analysis.png", key="cpk_tab")
         with col2:
             cpk_buffer = io.BytesIO()
             with pd.ExcelWriter(cpk_buffer, engine="openpyxl") as writer:
@@ -911,10 +1255,11 @@ with tab3:
     - **I 圖**：顯示個別量測值與控制限
     - **MR 圖**：顯示相鄰量測值的移動全距
     - **紅色圈點**：超出控制限的失控點
+    - **橘色菱形**：違反 Nelson 規則的異常模式點（偏移/趨勢等，在超限之前的預警）
     """)
 
-    # Calculate SPC data
-    spc_summary, spc_points = imr_spc_points(raw)
+    # Calculate SPC data (cached)
+    spc_summary, spc_points = _spc_cached(raw)
 
     if not spc_points.empty:
         # Dimension selector
@@ -926,9 +1271,28 @@ with tab3:
         )
 
         if selected_spc_dim:
+            # Nelson rules on this dimension (same point order as the I chart)
+            dim_points = spc_points[spc_points["dimension"] == selected_spc_dim]
+            nelson_df, nelson_findings = nelson_rules_for_dimension(dim_points["value"])
+
             # Build and display I-MR chart
-            imr_fig = build_imr_chart(spc_points, selected_spc_dim, height=chart_height + 200)
-            st.plotly_chart(imr_fig, use_container_width=True)
+            imr_fig = build_imr_chart(
+                spc_points, selected_spc_dim,
+                height=chart_height + 200,
+                nelson_points=nelson_df,
+            )
+            st.plotly_chart(imr_fig, use_container_width=True, config=PLOTLY_CONFIG)
+
+            # Nelson rule findings
+            if nelson_findings:
+                st.markdown("**Nelson 規則判讀：**")
+                for f in nelson_findings:
+                    pts_text = ", ".join(map(str, f["points"][:15]))
+                    if len(f["points"]) > 15:
+                        pts_text += f"...（共 {len(f['points'])} 點）"
+                    st.warning(f"**{f['rule']}**｜{f['description']}｜異常點序號：{pts_text}")
+            else:
+                st.success("✅ 未偵測到 Nelson 規則異常模式（無偏移、趨勢等前兆）")
 
             # Show SPC summary for selected dimension
             dim_summary = spc_summary[spc_summary["dimension"] == selected_spc_dim]
@@ -955,7 +1319,6 @@ with tab3:
                     st.write(f"MR 圖 LCL: 0")
 
             # Check for out-of-control points
-            dim_points = spc_points[spc_points["dimension"] == selected_spc_dim]
             x_ucl = dim_points["X_UCL"].iloc[0]
             x_lcl = dim_points["X_LCL"].iloc[0]
             mr_ucl = dim_points["MR_UCL"].iloc[0]
@@ -969,17 +1332,7 @@ with tab3:
             # Download buttons
             col1, col2 = st.columns(2)
             with col1:
-                try:
-                    spc_img = imr_fig.to_image(format="png", scale=3)
-                    st.download_button(
-                        "下載 SPC 圖 (PNG)",
-                        data=spc_img,
-                        file_name=f"{selected_spc_dim}_spc.png",
-                        mime="image/png",
-                        key="spc_png",
-                    )
-                except Exception:
-                    st.caption("PNG 下載需要 kaleido")
+                lazy_png_download(imr_fig, f"{selected_spc_dim}_spc.png", key="spc_tab")
             with col2:
                 spc_buffer = io.BytesIO()
                 with pd.ExcelWriter(spc_buffer, engine="openpyxl") as writer:
@@ -1000,7 +1353,7 @@ with tab3:
 with tab4:
     st.subheader("標準化偏離分析")
 
-    deviation_df = calculate_normalized_deviation(raw)
+    deviation_df = _deviation_cached(raw)
 
     if not deviation_df.empty:
         st.markdown("""
@@ -1020,7 +1373,7 @@ with tab4:
 
         if selected_dev_dim:
             dev_fig = build_normalized_deviation_chart(deviation_df, selected_dev_dim, chart_height)
-            st.plotly_chart(dev_fig, use_container_width=True)
+            st.plotly_chart(dev_fig, use_container_width=True, config=PLOTLY_CONFIG)
 
             # Show summary statistics for deviation
             dim_dev = deviation_df[deviation_df["dimension"] == selected_dev_dim]
@@ -1038,17 +1391,7 @@ with tab4:
             # Download buttons
             col1, col2 = st.columns(2)
             with col1:
-                try:
-                    dev_img = dev_fig.to_image(format="png", scale=3)
-                    st.download_button(
-                        "下載偏離圖 (PNG)",
-                        data=dev_img,
-                        file_name=f"{selected_dev_dim}_deviation.png",
-                        mime="image/png",
-                        key="dev_png",
-                    )
-                except Exception:
-                    st.caption("PNG 下載需要 kaleido")
+                lazy_png_download(dev_fig, f"{selected_dev_dim}_deviation.png", key="dev_tab")
             with col2:
                 dev_buffer = io.BytesIO()
                 with pd.ExcelWriter(dev_buffer, engine="openpyxl") as writer:
@@ -1086,7 +1429,7 @@ with tab5:
 
         if selected_pos_dim:
             pos_fig = build_position_comparison_chart(raw, selected_pos_dim, chart_height)
-            st.plotly_chart(pos_fig, use_container_width=True)
+            st.plotly_chart(pos_fig, use_container_width=True, config=PLOTLY_CONFIG)
 
             # Show position statistics
             pos_sub = raw[raw["dimension"] == selected_pos_dim].copy()
@@ -1101,17 +1444,7 @@ with tab5:
             # Download buttons
             col1, col2 = st.columns(2)
             with col1:
-                try:
-                    pos_img = pos_fig.to_image(format="png", scale=3)
-                    st.download_button(
-                        "下載模次比較圖 (PNG)",
-                        data=pos_img,
-                        file_name=f"{selected_pos_dim}_position.png",
-                        mime="image/png",
-                        key="pos_png",
-                    )
-                except Exception:
-                    st.caption("PNG 下載需要 kaleido")
+                lazy_png_download(pos_fig, f"{selected_pos_dim}_position.png", key="pos_tab")
             with col2:
                 pos_buffer = io.BytesIO()
                 with pd.ExcelWriter(pos_buffer, engine="openpyxl") as writer:
@@ -1125,6 +1458,66 @@ with tab5:
                 )
     else:
         st.info("資料中未包含模次位置資訊 (pos_in_mold)，無法進行模次比較分析。")
+
+    # Variance decomposition: cavity-to-cavity vs cycle-to-cycle
+    st.markdown("---")
+    st.markdown("### 🔬 變異來源分解（穴間 vs 模次間）")
+    st.caption(
+        "判斷改善方向的關鍵：穴間差異大 → 修模/模穴均一性方向；"
+        "模次間漂移大 → 成型條件穩定性（調機）方向。百分比為該因子解釋的變異占比。"
+    )
+
+    var_df = _variance_cached(raw)
+    if not var_df.empty:
+        var_disp = var_df.copy()
+        var_disp["穴間變異 %"] = var_disp["cavity_pct"].apply(
+            lambda x: f"{x:.0f}%" if pd.notna(x) else "—"
+        )
+        var_disp["模次間變異 %"] = var_disp["cycle_pct"].apply(
+            lambda x: f"{x:.0f}%" if pd.notna(x) else "—"
+        )
+        var_disp = var_disp[["dimension", "穴間變異 %", "cavity_groups", "模次間變異 %", "cycle_groups", "judgment"]]
+        var_disp.columns = ["維度", "穴間變異 %", "穴數", "模次間變異 %", "模次數", "判斷"]
+        st.dataframe(var_disp, use_container_width=True, hide_index=True)
+    else:
+        st.info("資料不足（每個維度至少需要 4 筆數據與穴號/模次資訊）")
+
+    # Cavity fingerprint: 每穴在各維度的偏離指紋，找出整體偏大/偏小的穴
+    st.markdown("---")
+    st.markdown("### 🖐️ 穴號指紋圖（找出整體偏移的穴/位置）")
+    st.caption(
+        "每條線代表一個穴（或位置/分組），Y 軸為標準化偏離%。整條線偏高/偏低，"
+        "代表該穴一致地偏大/偏小 → 修模仁的直接線索。"
+    )
+
+    fp_options = []
+    if "cavity" in raw.columns and raw["cavity"].dropna().nunique() >= 2:
+        fp_options.append(("按穴號 (cavity)", "cavity", "穴"))
+    if "pos_in_mold" in raw.columns and raw["pos_in_mold"].dropna().nunique() >= 2:
+        fp_options.append(("按位置 (pos_in_mold)", "pos_in_mold", "P"))
+    if "group" in raw.columns:
+        _fp_valid_groups = [g for g in raw["group"].unique() if g and "合併" not in str(g)]
+        if len(_fp_valid_groups) >= 2:
+            fp_options.append(("按分組 (group)", "group", ""))
+
+    if fp_options:
+        fp_choice = st.radio(
+            "分組方式",
+            options=[o[0] for o in fp_options],
+            horizontal=True,
+            key="fingerprint_group_method",
+        )
+        fp_col, fp_label = next((c, lbl) for (name, c, lbl) in fp_options if name == fp_choice)
+        fp_df = _fingerprint_cached(raw, fp_col)
+        if not fp_df.empty:
+            fp_fig = build_cavity_fingerprint(fp_df, group_label=fp_label or "組", height=chart_height)
+            st.plotly_chart(fp_fig, use_container_width=True, config=PLOTLY_CONFIG)
+            st.caption("提示：若某條線在多數維度都明顯高於/低於其他線，該穴很可能整體偏移，可優先檢查對應模仁。")
+            lazy_png_download(fp_fig, "cavity_fingerprint.png", key="fingerprint")
+        else:
+            st.info("此分組方式下沒有足夠的規格資訊可計算偏離")
+    else:
+        st.info("需要穴號、位置或分組資訊（且至少 2 組）才能繪製指紋圖")
 
 # Tab 6: Correlation Analysis
 with tab6:
@@ -1185,75 +1578,76 @@ with tab6:
                         high_pairs = get_high_correlation_pairs(corr_matrix, threshold=corr_threshold)
                         st.metric("高相關對數", len(high_pairs))
 
-                    # Display correlation heatmap
-                    corr_fig = build_correlation_heatmap(corr_matrix, height=max(400, len(corr_matrix) * 25 + 100))
-                    st.plotly_chart(corr_fig, use_container_width=True)
-
-                    # High correlation pairs
-                    st.markdown("### 高相關維度對")
-                    high_corr_pairs = get_high_correlation_pairs(corr_matrix, threshold=corr_threshold)
-
-                    if not high_corr_pairs.empty:
-                        display_pairs = high_corr_pairs.copy()
-                        display_pairs["相關性"] = display_pairs["correlation"].apply(
-                            lambda x: f"{'🔴' if x > 0 else '🔵'} {x:.3f}"
+                    # Guard: an all-NaN matrix renders as a blank heatmap.
+                    # Tell the user why instead of showing an empty image.
+                    if bool(corr_matrix.isna().all().all()):
+                        st.warning(
+                            "⚠️ 相關性矩陣無法計算（熱力圖會全空白）。可能原因：\n"
+                            f"- 有效配對樣本數過少（目前僅 {len(pivot_table)} 個，"
+                            "每對維度至少需 3 個配對樣本）\n"
+                            "- 各維度的量測點無法配對（缺少穴號/模次/位置等可對應的識別資訊）\n\n"
+                            "建議：上傳含多個模次或多穴的資料，或改用「全部合併」擴大樣本範圍。"
                         )
-                        display_pairs["強度"] = display_pairs["abs_correlation"].apply(
-                            lambda x: "強" if x >= 0.8 else "中"
-                        )
-                        display_pairs = display_pairs.rename(columns={"dim1": "維度 1", "dim2": "維度 2"})
-
-                        st.dataframe(
-                            display_pairs[["維度 1", "維度 2", "相關性", "強度"]],
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-
-                        # Scatter plot
-                        st.markdown("### 散佈圖")
-                        pair_options = [
-                            f"{row['dim1']} vs {row['dim2']} (r={row['correlation']:.3f})"
-                            for _, row in high_corr_pairs.iterrows()
-                        ]
-                        selected_pair = st.selectbox("選擇維度對", options=pair_options, key="corr_pair_select")
-
-                        if selected_pair:
-                            pair_idx = pair_options.index(selected_pair)
-                            dim1 = high_corr_pairs.iloc[pair_idx]["dim1"]
-                            dim2 = high_corr_pairs.iloc[pair_idx]["dim2"]
-                            scatter_fig = build_correlation_scatter(pivot_table, dim1, dim2, chart_height)
-                            st.plotly_chart(scatter_fig, use_container_width=True)
                     else:
-                        st.info(f"沒有找到相關係數絕對值 >= {corr_threshold} 的維度對")
+                        # Display correlation heatmap
+                        corr_fig = build_correlation_heatmap(corr_matrix, height=max(400, len(corr_matrix) * 25 + 100))
+                        st.plotly_chart(corr_fig, use_container_width=True, config=PLOTLY_CONFIG)
 
-                    # Download buttons
-                    st.markdown("---")
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        try:
-                            corr_img = corr_fig.to_image(format="png", scale=3)
-                            st.download_button(
-                                "下載熱力圖 (PNG)",
-                                data=corr_img,
-                                file_name="correlation_heatmap.png",
-                                mime="image/png",
-                                key="corr_png",
+                        # High correlation pairs
+                        st.markdown("### 高相關維度對")
+                        high_corr_pairs = get_high_correlation_pairs(corr_matrix, threshold=corr_threshold)
+
+                        if not high_corr_pairs.empty:
+                            display_pairs = high_corr_pairs.copy()
+                            display_pairs["相關性"] = display_pairs["correlation"].apply(
+                                lambda x: f"{'🔴' if x > 0 else '🔵'} {x:.3f}"
                             )
-                        except Exception:
-                            st.caption("PNG 下載需要 kaleido")
-                    with col2:
-                        corr_buffer = io.BytesIO()
-                        with pd.ExcelWriter(corr_buffer, engine="openpyxl") as writer:
-                            corr_matrix.to_excel(writer, sheet_name="correlation_matrix")
-                            if not high_corr_pairs.empty:
-                                high_corr_pairs.to_excel(writer, index=False, sheet_name="high_correlation_pairs")
-                        st.download_button(
-                            "下載相關性資料 (Excel)",
-                            data=corr_buffer.getvalue(),
-                            file_name="correlation_analysis.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key="corr_xlsx",
-                        )
+                            display_pairs["強度"] = display_pairs["abs_correlation"].apply(
+                                lambda x: "強" if x >= 0.8 else "中"
+                            )
+                            display_pairs = display_pairs.rename(columns={"dim1": "維度 1", "dim2": "維度 2"})
+
+                            st.dataframe(
+                                display_pairs[["維度 1", "維度 2", "相關性", "強度"]],
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+
+                            # Scatter plot
+                            st.markdown("### 散佈圖")
+                            pair_options = [
+                                f"{row['dim1']} vs {row['dim2']} (r={row['correlation']:.3f})"
+                                for _, row in high_corr_pairs.iterrows()
+                            ]
+                            selected_pair = st.selectbox("選擇維度對", options=pair_options, key="corr_pair_select")
+
+                            if selected_pair:
+                                pair_idx = pair_options.index(selected_pair)
+                                dim1 = high_corr_pairs.iloc[pair_idx]["dim1"]
+                                dim2 = high_corr_pairs.iloc[pair_idx]["dim2"]
+                                scatter_fig = build_correlation_scatter(pivot_table, dim1, dim2, chart_height)
+                                st.plotly_chart(scatter_fig, use_container_width=True, config=PLOTLY_CONFIG)
+                        else:
+                            st.info(f"沒有找到相關係數絕對值 >= {corr_threshold} 的維度對")
+
+                        # Download buttons
+                        st.markdown("---")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            lazy_png_download(corr_fig, "correlation_heatmap.png", key="corr_tab")
+                        with col2:
+                            corr_buffer = io.BytesIO()
+                            with pd.ExcelWriter(corr_buffer, engine="openpyxl") as writer:
+                                corr_matrix.to_excel(writer, sheet_name="correlation_matrix")
+                                if not high_corr_pairs.empty:
+                                    high_corr_pairs.to_excel(writer, index=False, sheet_name="high_correlation_pairs")
+                            st.download_button(
+                                "下載相關性資料 (Excel)",
+                                data=corr_buffer.getvalue(),
+                                file_name="correlation_analysis.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key="corr_xlsx",
+                            )
                 else:
                     st.warning("資料不足以計算相關性矩陣（需要至少 2 個維度）")
             else:
@@ -1502,3 +1896,191 @@ with tab6:
                        "- 顯示模式為「全部合併」")
     else:
         st.info("需要至少 2 個維度才能進行相關性分析")
+
+# Tab 7: Dimension Detail — 單一維度的完整檢視
+with tab_detail:
+    st.subheader("🔍 維度詳情")
+    st.caption("一頁看完單一維度的所有視角：盒鬚圖、分布直方圖、I-MR 控制圖與全部統計判讀")
+
+    detail_dim = st.selectbox("選擇維度", options=all_dimensions, key="detail_dim_select")
+
+    if detail_dim:
+        detail_sub = raw[raw["dimension"] == detail_dim].copy()
+        d_nominal, d_upper, d_lower, _ = pick_spec_values(detail_sub)
+        d_values = detail_sub["value"].astype(float)
+        d_oos_mask = calc_out_of_spec(d_values, d_lower, d_upper)
+
+        # Key metrics row
+        d_cpk_row = cpk_df[cpk_df["dimension"] == detail_dim] if not cpk_df.empty else pd.DataFrame()
+        dm1, dm2, dm3, dm4, dm5 = st.columns(5)
+        with dm1:
+            st.metric("樣本數", int(d_values.count()))
+        with dm2:
+            st.metric("平均值", f"{d_values.mean():.4f}")
+        with dm3:
+            st.metric("標準差", f"{d_values.std(ddof=1):.4f}" if d_values.count() >= 2 else "N/A")
+        with dm4:
+            if not d_cpk_row.empty and pd.notna(d_cpk_row.iloc[0]["Cpk"]):
+                r = d_cpk_row.iloc[0]
+                st.metric("Cpk", f"{r['Cpk']:.3f}", delta=r["rating"],
+                          delta_color="normal" if r["rating"] == "良好" else "inverse")
+                if pd.notna(r.get("Cpk_LCI")):
+                    st.caption(f"95% CI [{r['Cpk_LCI']:.2f}, {r['Cpk_UCI']:.2f}]")
+            else:
+                st.metric("Cpk", "N/A")
+        with dm5:
+            st.metric("超規格點", int(d_oos_mask.sum()),
+                      delta="需處理" if d_oos_mask.any() else None, delta_color="inverse")
+
+        # Box plot + histogram side by side
+        col_box, col_hist = st.columns(2)
+        with col_box:
+            d_fig = build_fig(detail_sub, detail_dim, 420)
+            add_spec_band(d_fig, d_lower, d_upper)
+            add_spec_lines(d_fig, d_nominal, d_upper, d_lower)
+            add_out_of_spec_points(d_fig, detail_sub, d_lower, d_upper)
+            apply_y_range(d_fig, detail_sub, d_lower, d_upper, False)
+            st.plotly_chart(d_fig, use_container_width=True, config=PLOTLY_CONFIG)
+        with col_hist:
+            d_hist = build_histogram(detail_sub, detail_dim, d_nominal, d_upper, d_lower, 420)
+            st.plotly_chart(d_hist, use_container_width=True, config=PLOTLY_CONFIG)
+
+        # I-MR chart with Nelson markers
+        _, d_spc_points = _spc_cached(raw)
+        d_dim_points = d_spc_points[d_spc_points["dimension"] == detail_dim]
+        d_nelson_df, d_nelson_findings = nelson_rules_for_dimension(d_dim_points["value"])
+        d_imr = build_imr_chart(d_spc_points, detail_dim, height=560, nelson_points=d_nelson_df)
+        st.plotly_chart(d_imr, use_container_width=True, config=PLOTLY_CONFIG)
+
+        # Diagnostic findings
+        st.markdown("### 📋 判讀結果")
+
+        d_norm = normality_test(d_values)
+        if d_norm["is_normal"] is False:
+            st.warning(f"📉 常態性：{d_norm['message']}（建議以直方圖確認分布形狀）")
+        elif d_norm["is_normal"] is True:
+            st.success(f"📈 常態性：{d_norm['message']}")
+        else:
+            st.info(f"📈 常態性：{d_norm['message']}")
+
+        if d_nelson_findings:
+            for f in d_nelson_findings:
+                pts_text = ", ".join(map(str, f["points"][:15]))
+                if len(f["points"]) > 15:
+                    pts_text += f"...（共 {len(f['points'])} 點）"
+                st.warning(f"⚡ SPC {f['rule']}｜{f['description']}｜異常點序號：{pts_text}")
+        else:
+            st.success("⚡ SPC：未偵測到 Nelson 規則異常模式")
+
+        d_overview_row = overview_df[overview_df["dimension"] == detail_dim]
+        if not d_overview_row.empty and d_overview_row.iloc[0]["suggestion"]:
+            st.warning(f"🔧 調機建議：{d_overview_row.iloc[0]['suggestion']}")
+
+        d_var = _variance_cached(raw)
+        d_var_row = d_var[d_var["dimension"] == detail_dim] if not d_var.empty else pd.DataFrame()
+        if not d_var_row.empty:
+            vr = d_var_row.iloc[0]
+            cav_txt = f"{vr['cavity_pct']:.0f}%" if pd.notna(vr["cavity_pct"]) else "—"
+            cyc_txt = f"{vr['cycle_pct']:.0f}%" if pd.notna(vr["cycle_pct"]) else "—"
+            st.info(f"🔬 變異分解：穴間 {cav_txt}、模次間 {cyc_txt} — {vr['judgment']}")
+
+        # Out-of-spec point traceability table
+        if d_oos_mask.any():
+            st.markdown("### ❌ 超規格量測點（溯源）")
+            oos_cols = [c for c in ["value", "group", "pos_tag", "mold", "cavity", "cycle", "file"]
+                        if c in detail_sub.columns]
+            oos_table = detail_sub.loc[d_oos_mask, oos_cols].copy()
+            rename_map = {"value": "量測值", "group": "分組", "pos_tag": "標籤",
+                          "mold": "模次", "cavity": "穴號", "cycle": "模次序", "file": "檔案"}
+            oos_table.columns = [rename_map.get(c, c) for c in oos_table.columns]
+            st.dataframe(oos_table, use_container_width=True, hide_index=True)
+            st.caption(f"規格範圍：{d_lower:.4f} ~ {d_upper:.4f}" if pd.notna(d_lower) and pd.notna(d_upper) else "")
+
+        download_excel_button(detail_sub, f"{detail_dim}_detail.xlsx")
+
+# Tab 8: AI Report — 把已算好的統計結果交給 Gemini 寫成人類可讀的報告
+with tab_ai:
+    st.subheader("🤖 AI 分析報告")
+    st.caption(
+        f"目前分析情境：**{analysis_stage}**。AI 僅根據系統已計算好的統計數字撰寫報告，"
+        "不自行運算或捏造數據。免 API 的結構化摘要一定可用；填入 Gemini 金鑰後可額外產生 AI 敘述報告。"
+    )
+
+    # Build the deterministic payload once (shared by offline + AI report),
+    # 依目前分析情境調整解讀框架
+    ai_payload = build_analysis_payload(raw, analysis_stage)
+    offline_text = format_payload_as_text(ai_payload)
+
+    with st.expander("📄 結構化摘要（免 API，離線可用）", expanded=True):
+        st.text(offline_text)
+        st.download_button(
+            "下載結構化摘要 (TXT)",
+            data=offline_text.encode("utf-8"),
+            file_name="analysis_summary.txt",
+            mime="text/plain",
+            key="offline_summary_dl",
+        )
+
+    st.markdown("---")
+    st.markdown("### 🤖 Gemini AI 敘述報告")
+
+    # Resolve API key: prefer secrets/env, fall back to a password input
+    key_from_secret = ""
+    try:
+        key_from_secret = st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        key_from_secret = ""
+    if not key_from_secret:
+        key_from_secret = os.environ.get("GEMINI_API_KEY", "")
+
+    col_key, col_model = st.columns([2, 1])
+    with col_key:
+        if key_from_secret:
+            st.success("已從 secrets/環境變數載入 API 金鑰")
+            api_key = key_from_secret
+        else:
+            api_key = st.text_input(
+                "Gemini API 金鑰",
+                type="password",
+                help="於 Google AI Studio (aistudio.google.com) 免費申請；"
+                     "或設定 st.secrets['GEMINI_API_KEY'] / 環境變數 GEMINI_API_KEY",
+                key="gemini_api_key_input",
+            )
+    with col_model:
+        model_name = st.selectbox(
+            "模型",
+            options=AVAILABLE_GEMINI_MODELS,
+            index=AVAILABLE_GEMINI_MODELS.index(DEFAULT_GEMINI_MODEL),
+            key="gemini_model_select",
+            help="Flash 系列皆有免費額度；3.5 最新、2.5-lite 最省",
+        )
+
+    st.caption(
+        "⚠️ 隱私提醒：產生 AI 報告會將上方結構化摘要（含尺寸名稱與統計值）傳送至 Google API。"
+        "若量測資料涉及機密，請改用上方離線摘要。"
+    )
+
+    # Only call the API on explicit click (avoids cost on every rerun);
+    # cache the result in session_state so reruns keep showing it.
+    if st.button("✨ 產生 AI 報告", key="gen_ai_report", disabled=not api_key):
+        with st.spinner(f"正在以 {model_name} 產生報告..."):
+            try:
+                report_text = generate_ai_report(offline_text, api_key, model_name, analysis_stage)
+                st.session_state["ai_report_text"] = report_text
+                st.session_state["ai_report_error"] = None
+            except RuntimeError as exc:
+                st.session_state["ai_report_text"] = None
+                st.session_state["ai_report_error"] = str(exc)
+
+    if st.session_state.get("ai_report_error"):
+        st.error(f"產生失敗：{st.session_state['ai_report_error']}")
+    if st.session_state.get("ai_report_text"):
+        st.markdown(st.session_state["ai_report_text"])
+        st.download_button(
+            "下載 AI 報告 (Markdown)",
+            data=st.session_state["ai_report_text"].encode("utf-8"),
+            file_name="ai_quality_report.md",
+            mime="text/markdown",
+            key="ai_report_dl",
+        )
+        st.caption("AI 報告可能有誤，請對照實際數據與圖表確認後再作決策。")

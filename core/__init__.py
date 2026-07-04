@@ -2,18 +2,29 @@
 
 from .excel_parser import load_excel, parse_focus_dimensions
 from .statistics import (
+    NELSON_RULE_DESCRIPTIONS,
     calc_out_of_spec,
     pick_spec_values,
     stats_table,
     cp_cpk_summary,
     cpk_with_rating,
+    cpk_confidence_interval,
     imr_spc_points,
     calculate_normalized_deviation,
     calculate_correlation_matrix,
     get_high_correlation_pairs,
+    check_nelson_rules,
+    nelson_rules_for_dimension,
+    normality_test,
+    variance_decomposition,
+    center_offset_suggestion,
+    diagnose_overview,
+    cavity_fingerprint_data,
+    detect_systematic_bias,
 )
 from .visualization import (
     add_spec_lines,
+    add_spec_band,
     build_fig,
     apply_y_range,
     add_spec_edge_markers,
@@ -24,6 +35,10 @@ from .visualization import (
     build_imr_chart,
     build_correlation_heatmap,
     build_correlation_scatter,
+    build_histogram,
+    build_cpk_trend,
+    build_cavity_fingerprint,
+    build_pareto_chart,
 )
 from .export import (
     download_plot_button,
@@ -35,23 +50,47 @@ from .export import (
     download_pdf_report_button,
 )
 from .grouping import format_pos, assign_groups_vectorized
+from .ai_report import (
+    DEFAULT_GEMINI_MODEL,
+    AVAILABLE_GEMINI_MODELS,
+    STAGE_LABELS,
+    DEFAULT_STAGE,
+    STAGE_TRYOUT,
+    STAGE_FIRST_ARTICLE,
+    STAGE_MONITORING,
+    build_analysis_payload,
+    format_payload_as_text,
+    generate_ai_report,
+    resolve_report,
+)
 
 __all__ = [
     # Excel parser
     "load_excel",
     "parse_focus_dimensions",
     # Statistics
+    "NELSON_RULE_DESCRIPTIONS",
     "calc_out_of_spec",
     "pick_spec_values",
     "stats_table",
     "cp_cpk_summary",
     "cpk_with_rating",
+    "cpk_confidence_interval",
     "imr_spc_points",
     "calculate_normalized_deviation",
     "calculate_correlation_matrix",
     "get_high_correlation_pairs",
+    "check_nelson_rules",
+    "nelson_rules_for_dimension",
+    "normality_test",
+    "variance_decomposition",
+    "center_offset_suggestion",
+    "diagnose_overview",
+    "cavity_fingerprint_data",
+    "detect_systematic_bias",
     # Visualization
     "add_spec_lines",
+    "add_spec_band",
     "build_fig",
     "apply_y_range",
     "add_spec_edge_markers",
@@ -62,6 +101,10 @@ __all__ = [
     "build_imr_chart",
     "build_correlation_heatmap",
     "build_correlation_scatter",
+    "build_histogram",
+    "build_cpk_trend",
+    "build_cavity_fingerprint",
+    "build_pareto_chart",
     # Export
     "download_plot_button",
     "download_excel_button",
@@ -73,4 +116,16 @@ __all__ = [
     # Grouping
     "format_pos",
     "assign_groups_vectorized",
+    # AI report
+    "DEFAULT_GEMINI_MODEL",
+    "AVAILABLE_GEMINI_MODELS",
+    "STAGE_LABELS",
+    "DEFAULT_STAGE",
+    "STAGE_TRYOUT",
+    "STAGE_FIRST_ARTICLE",
+    "STAGE_MONITORING",
+    "build_analysis_payload",
+    "format_payload_as_text",
+    "generate_ai_report",
+    "resolve_report",
 ]

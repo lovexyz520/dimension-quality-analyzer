@@ -52,26 +52,66 @@ def add_spec_lines(fig: go.Figure, nominal: float, upper: float, lower: float) -
         )
 
 
+def _hover_columns(sub: pd.DataFrame) -> list:
+    """Pick traceability columns that exist and contain data (for hover)."""
+    candidates = ["pos_tag", "mold", "cavity", "cycle", "file"]
+    return [
+        c
+        for c in candidates
+        if c in sub.columns and sub[c].notna().any()
+    ]
+
+
 def build_fig(sub: pd.DataFrame, dim: str, height: int) -> go.Figure:
-    """Build box-and-whisker plot figure."""
+    """Build box-and-whisker plot figure.
+
+    Points are drawn at category center (jitter=0) so out-of-spec overlay
+    markers align exactly with the actual data points. Hover shows
+    traceability info (mold/cavity/cycle) and a dashed mean line is shown.
+    """
     fig = px.box(
         sub,
         x="group",
         y="value",
         color="group",
         points="all",
+        hover_data=_hover_columns(sub),
     )
-    fig.update_traces(jitter=0.2, pointpos=0, marker=dict(size=7, opacity=0.85))
+    fig.update_traces(
+        jitter=0, pointpos=0, marker=dict(size=7, opacity=0.85), boxmean=True
+    )
+
+    # Show per-group sample size on x labels: small n means the box shape
+    # is statistically weak — read the points, not the box.
+    counts = sub.groupby("group")["value"].count()
+    fig.update_xaxes(
+        tickmode="array",
+        tickvals=list(counts.index),
+        ticktext=[f"{g}<br>(n={c})" for g, c in counts.items()],
+    )
+
     fig.update_layout(
         title=dim,
         xaxis_title=None,
         yaxis_title="量測值",
         showlegend=False,
         height=height,
-        margin=dict(l=60, r=140, t=60, b=50),
+        margin=dict(l=60, r=140, t=60, b=60),
         font=dict(family=CJK_FONT),
     )
     return fig
+
+
+def add_spec_band(fig: go.Figure, lower: float, upper: float) -> None:
+    """Shade the in-spec zone (LSL~USL) so off-center boxes read at a glance."""
+    if pd.notna(lower) and pd.notna(upper) and upper > lower:
+        fig.add_hrect(
+            y0=lower,
+            y1=upper,
+            fillcolor="rgba(46, 204, 113, 0.10)",
+            line_width=0,
+            layer="below",
+        )
 
 
 def apply_y_range(
@@ -134,12 +174,21 @@ def add_out_of_spec_points(
     if not mask.any():
         return
     out = sub.loc[mask]
+
+    hover_cols = _hover_columns(out)
+    custom = out[hover_cols].astype(str).values if hover_cols else None
+    hover_extra = "".join(
+        f"<br>{col}: %{{customdata[{i}]}}" for i, col in enumerate(hover_cols)
+    )
+
     fig.add_trace(
         go.Scatter(
             x=out["group"],
             y=out["value"],
             mode="markers",
-            marker=dict(color="red", size=7, symbol="circle-open"),
+            marker=dict(color="red", size=12, symbol="circle-open", line=dict(width=2)),
+            customdata=custom,
+            hovertemplate="超規格: %{y}" + hover_extra + "<extra></extra>",
             showlegend=False,
         )
     )
@@ -283,7 +332,8 @@ def build_normalized_deviation_chart(
 
 
 def build_imr_chart(
-    spc_points: pd.DataFrame, dim: str, height: int = 500
+    spc_points: pd.DataFrame, dim: str, height: int = 500,
+    nelson_points: pd.DataFrame = None,
 ) -> go.Figure:
     """Build I-MR (Individual-Moving Range) control chart.
 
@@ -359,6 +409,23 @@ def build_imr_chart(
             annotation_text=f"LCL={x_lcl:.4f}", annotation_position="right",
             row=1, col=1
         )
+
+    # Mark Nelson-rule violation points on I chart (orange diamonds)
+    if nelson_points is not None and not nelson_points.empty:
+        viol = nelson_points[nelson_points["violated"]]
+        if not viol.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=viol["index"],
+                    y=viol["value"],
+                    mode="markers",
+                    name="Nelson 規則異常",
+                    marker=dict(color="orange", size=11, symbol="diamond-open", line=dict(width=2)),
+                    customdata=[", ".join(r) for r in viol["rules"]],
+                    hovertemplate="第 %{x} 點: %{y}<br>違反規則: %{customdata}<extra></extra>",
+                ),
+                row=1, col=1
+            )
 
     # Mark out-of-control points on I chart
     ooc_mask = (sub["value"] > x_ucl) | (sub["value"] < x_lcl)
@@ -484,8 +551,12 @@ def build_position_comparison_chart(
         y="value",
         color="position",
         points="all",
+        hover_data=_hover_columns(sub),
     )
-    fig.update_traces(jitter=0.2, pointpos=0, marker=dict(size=7, opacity=0.85))
+    fig.update_traces(
+        jitter=0, pointpos=0, marker=dict(size=7, opacity=0.85), boxmean=True
+    )
+    add_spec_band(fig, lower, upper)
 
     # Add specification lines
     if pd.notna(upper):
@@ -659,4 +730,254 @@ def build_correlation_scatter(
         legend=dict(x=0.02, y=0.98),
     )
 
+    return fig
+
+
+def build_histogram(
+    sub: pd.DataFrame,
+    dim: str,
+    nominal: float,
+    upper: float,
+    lower: float,
+    height: int = 400,
+) -> go.Figure:
+    """Build histogram with normal-curve overlay and spec lines.
+
+    搭配常態性檢定使用：直方圖能看出偏態/雙峰等 Cpk 假設失效的情況。
+    """
+    values = sub["value"].astype(float).dropna()
+
+    fig = go.Figure()
+    if values.empty:
+        fig.update_layout(
+            title=f"{dim} - 分布直方圖 (無資料)",
+            height=height,
+            font=dict(family=CJK_FONT),
+        )
+        return fig
+
+    fig.add_trace(
+        go.Histogram(
+            x=values,
+            histnorm="probability density",
+            marker_color="#3498db",
+            opacity=0.75,
+            name="量測值",
+        )
+    )
+
+    mean = values.mean()
+    std = values.std(ddof=1)
+    if len(values) >= 3 and pd.notna(std) and std > 0:
+        lo_candidates = [values.min()] + ([lower] if pd.notna(lower) else [])
+        hi_candidates = [values.max()] + ([upper] if pd.notna(upper) else [])
+        lo, hi = min(lo_candidates), max(hi_candidates)
+        span = hi - lo if hi > lo else abs(hi) * 0.1 + 0.1
+        xs = np.linspace(lo - span * 0.1, hi + span * 0.1, 200)
+        pdf = np.exp(-((xs - mean) ** 2) / (2 * std**2)) / (std * np.sqrt(2 * np.pi))
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=pdf,
+                mode="lines",
+                line=dict(color="#e67e22", width=2),
+                name="常態曲線",
+            )
+        )
+
+    if pd.notna(upper):
+        fig.add_vline(x=upper, line_color="red", line_width=2,
+                      annotation_text=f"上限 {upper:.4f}", annotation_position="top")
+    if pd.notna(nominal):
+        fig.add_vline(x=nominal, line_color="red", line_width=1, line_dash="dot",
+                      annotation_text=f"中值 {nominal:.4f}", annotation_position="top")
+    if pd.notna(lower):
+        fig.add_vline(x=lower, line_color="red", line_width=2,
+                      annotation_text=f"下限 {lower:.4f}", annotation_position="top")
+
+    fig.update_layout(
+        title=f"{dim} - 分布直方圖",
+        xaxis_title="量測值",
+        yaxis_title="機率密度",
+        height=height,
+        margin=dict(l=60, r=60, t=80, b=50),
+        font=dict(family=CJK_FONT),
+        showlegend=False,
+        bargap=0.05,
+    )
+    return fig
+
+
+def build_cpk_trend(trend_df: pd.DataFrame, height: int = 450) -> go.Figure:
+    """Build cross-file Cpk trend chart (one line per dimension).
+
+    Args:
+        trend_df: DataFrame with columns: file, dimension, Cpk.
+            File order is preserved as given (e.g. upload order = time order).
+    """
+    if trend_df.empty:
+        fig = go.Figure()
+        fig.update_layout(
+            title="跨檔案 Cpk 趨勢 (無資料)",
+            height=height,
+            font=dict(family=CJK_FONT),
+        )
+        return fig
+
+    file_order = list(dict.fromkeys(trend_df["file"].tolist()))
+
+    fig = px.line(
+        trend_df,
+        x="file",
+        y="Cpk",
+        color="dimension",
+        markers=True,
+    )
+    fig.add_hline(y=1.33, line_color="green", line_width=1.5, line_dash="dash",
+                  annotation_text="良好 (1.33)", annotation_position="right")
+    fig.add_hline(y=1.0, line_color="orange", line_width=1.5, line_dash="dash",
+                  annotation_text="可接受 (1.0)", annotation_position="right")
+
+    fig.update_xaxes(categoryorder="array", categoryarray=file_order)
+    fig.update_layout(
+        title="跨檔案 Cpk 趨勢（依上傳順序）",
+        xaxis_title="檔案",
+        yaxis_title="Cpk",
+        height=height,
+        margin=dict(l=60, r=100, t=60, b=80),
+        font=dict(family=CJK_FONT),
+        legend_title_text="維度",
+    )
+    return fig
+
+
+def build_cavity_fingerprint(
+    fp_df: pd.DataFrame, group_label: str = "穴號", height: int = 480
+) -> go.Figure:
+    """Build cavity fingerprint chart: one line per cavity across all dimensions.
+
+    每條線代表一個穴（或位置/分組），Y 軸為標準化偏離%。線整體偏高/偏低
+    即代表該穴一致地偏大/偏小 → 修模方向的直接線索。
+    """
+    if fp_df.empty:
+        fig = go.Figure()
+        fig.update_layout(
+            title="穴號指紋圖 (無資料)",
+            height=height,
+            font=dict(family=CJK_FONT),
+        )
+        return fig
+
+    dims_order = sorted(fp_df["dimension"].unique().tolist())
+    fp_df = fp_df.copy()
+    fp_df["group_str"] = fp_df["group_val"].apply(
+        lambda x: f"{group_label}{int(x)}" if isinstance(x, (int, float)) and float(x).is_integer() else f"{group_label}{x}"
+    )
+
+    fig = px.line(
+        fp_df,
+        x="dimension",
+        y="deviation_pct",
+        color="group_str",
+        markers=True,
+        category_orders={"dimension": dims_order},
+    )
+
+    # Spec edges (±100%) and center (0%) reference lines
+    fig.add_hline(y=0, line_color="green", line_width=1.5)
+    fig.add_hline(y=100, line_color="red", line_width=1, line_dash="dash",
+                  annotation_text="上限 +100%", annotation_position="right")
+    fig.add_hline(y=-100, line_color="red", line_width=1, line_dash="dash",
+                  annotation_text="下限 -100%", annotation_position="right")
+
+    fig.update_layout(
+        title=f"{group_label}指紋圖（各{group_label}在各維度的標準化偏離）",
+        xaxis_title="維度",
+        yaxis_title="標準化偏離 %",
+        height=height,
+        margin=dict(l=60, r=110, t=60, b=100),
+        font=dict(family=CJK_FONT),
+        legend_title_text=group_label,
+        xaxis_tickangle=-45,
+    )
+    return fig
+
+
+def build_pareto_chart(
+    df: pd.DataFrame,
+    label_col: str,
+    value_col: str,
+    title: str = "Pareto 排列圖",
+    height: int = 460,
+) -> go.Figure:
+    """Build a Pareto chart: sorted bars + cumulative percentage line.
+
+    依數量由大到小排序長條，疊上累積百分比折線與 80% 參考線，
+    協助依「先解決影響最大的少數」原則決定處理優先序。
+    """
+    from plotly.subplots import make_subplots
+
+    data = df[[label_col, value_col]].copy()
+    data = data[data[value_col] > 0]
+    data = data.sort_values(value_col, ascending=False).reset_index(drop=True)
+
+    if data.empty:
+        fig = go.Figure()
+        fig.update_layout(
+            title=f"{title} (無異常項目)",
+            height=height,
+            font=dict(family=CJK_FONT),
+        )
+        fig.add_annotation(
+            text="沒有需要排序的異常項目 🎉",
+            xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False,
+            font=dict(family=CJK_FONT, size=16),
+        )
+        return fig
+
+    total = data[value_col].sum()
+    data["cum_pct"] = data[value_col].cumsum() / total * 100
+    labels = data[label_col].astype(str).tolist()
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    fig.add_trace(
+        go.Bar(
+            x=labels,
+            y=data[value_col],
+            marker_color="#e67e22",
+            name="數量",
+            text=data[value_col],
+            textposition="outside",
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=labels,
+            y=data["cum_pct"],
+            mode="lines+markers",
+            line=dict(color="#2c3e50", width=2),
+            name="累積 %",
+        ),
+        secondary_y=True,
+    )
+
+    fig.add_hline(
+        y=80, line_color="red", line_width=1, line_dash="dash",
+        annotation_text="80%", annotation_position="right",
+        secondary_y=True,
+    )
+
+    fig.update_yaxes(title_text="數量", secondary_y=False)
+    fig.update_yaxes(title_text="累積 %", range=[0, 105], secondary_y=True)
+    fig.update_layout(
+        title=title,
+        xaxis_title="",
+        height=height,
+        margin=dict(l=60, r=80, t=60, b=110),
+        font=dict(family=CJK_FONT),
+        xaxis_tickangle=-45,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
     return fig
