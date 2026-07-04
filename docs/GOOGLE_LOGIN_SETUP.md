@@ -126,6 +126,7 @@ python -c "import secrets; print(secrets.token_hex(32))"
 | `Access blocked: app not verified` / 無法登入 | 同意畫面在「測試中」，但登入帳號不在測試使用者清單。回步驟 1-2 加入該帳號。 |
 | 登入後仍被擋「未獲授權」 | 該 email 不在 `allowed_emails`。加入清單（大小寫不拘）。 |
 | 設定後仍直接進入、無登入畫面 | `[auth]` 未正確存入 Secrets（TOML 格式錯、或存在錯的地方）。確認貼在 app 的 Secrets、格式為 `[auth]` 區塊。 |
+| `StreamlitMissingAuthlibError` / `No module named 'httpx'` | 登入需要 `Authlib` 與 `httpx`（`requirements.txt` 已含）。若雲端仍報錯，代表 app 未以最新 `requirements.txt` 重新部署：Manage app → Reboot，或確認已抓到最新 commit 重新 build。 |
 | 大家突然都被登出 | `cookie_secret` 被改動。保持固定不要換。 |
 | 找不到 app 的正確網址 | 在 Streamlit Cloud 開啟 app，複製瀏覽器網址列那串 `https://xxx.streamlit.app`。 |
 
