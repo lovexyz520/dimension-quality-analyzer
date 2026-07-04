@@ -112,6 +112,13 @@ streamlit run streamlit_app.py
 - **HTML 報表** - 包含圖表的完整報告
 - **ZIP 打包** - 批次下載所有圖表
 
+## 部署與登入保護
+
+部署到 Streamlit Cloud 並開啟 Google 帳號登入（保護機密量測資料）的完整步驟，
+請見 **[docs/GOOGLE_LOGIN_SETUP.md](docs/GOOGLE_LOGIN_SETUP.md)**。
+
+> ⚠️ 在完成 `[auth]` 設定之前，線上 app 為公開狀態；設定前請勿上傳機密資料。
+
 ## 授權
 
 本專案採用 MIT 授權條款 - 詳見 [LICENSE](LICENSE) 檔案
