@@ -346,6 +346,16 @@ def _require_auth() -> None:
     except Exception:
         auth_configured = False
     if not auth_configured:
+        # 未設定登入時，本機開發保持安靜；但若偵測到部署在 Streamlit Cloud
+        # （工作路徑位於 /mount/src），則大聲警告「目前無保護、任何人可存取」，
+        # 避免誤以為已受保護。
+        on_cloud = "/mount/src" in os.path.abspath(__file__).replace("\\", "/")
+        if on_cloud:
+            st.warning(
+                "⚠️ **登入保護尚未啟用——目前任何人皆可存取本站與其中的量測資料。**\n\n"
+                "請到 Streamlit Cloud 的 App settings → Secrets 設定 `[auth]`（Google OIDC）"
+                "與 `allowed_emails` 白名單以開啟登入。設定方式見 `.streamlit/secrets.toml.example`。"
+            )
         return  # 本機開發或未設定登入
 
     user = getattr(st, "user", None)
