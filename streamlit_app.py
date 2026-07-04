@@ -1041,7 +1041,7 @@ with tab_overview:
                     return "background-color: #e74c3c; color: white"
                 return ""
 
-            styled = disp.style.applymap(_color_rating, subset=["評級"])
+            styled = disp.style.map(_color_rating, subset=["評級"])
             styled = styled.format({"Cpk": "{:.3f}"}, na_rep="N/A")
             st.dataframe(styled, use_container_width=True, hide_index=True)
 
@@ -1238,7 +1238,7 @@ with tab2:
                 return "background-color: #e74c3c; color: white"
             return ""
 
-        styled_df = display_df.style.applymap(color_rating, subset=["評級"])
+        styled_df = display_df.style.map(color_rating, subset=["評級"])
         styled_df = styled_df.format({
             "平均值": "{:.4f}",
             "標準差": "{:.4f}",

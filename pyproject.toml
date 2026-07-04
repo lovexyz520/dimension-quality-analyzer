@@ -4,7 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
   "streamlit>=1.42",
-  "pandas>=2.0",
+  "pandas>=2.1",
   "openpyxl>=3.1",
   "plotly>=5.18",
   "numpy>=1.24",
