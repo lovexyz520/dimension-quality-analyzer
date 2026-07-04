@@ -35,7 +35,9 @@
 2. 上方 **建立憑證 → OAuth 用戶端 ID**
 3. 應用程式類型：**網頁應用程式 (Web application)**
 4. 名稱：例如 `streamlit-app`
-5. **已授權的重新導向 URI (Authorized redirect URIs)** → 新增兩個（本機 + 雲端）：
+5. ⚠️ 頁面上有**兩個**欄位，別填錯：
+   - 「**已授權的 JavaScript 來源**」→ **留空**（此欄不能有路徑，填 `/oauth2callback` 會報「來源無效」）
+   - 「**已授權的重新導向 URI (Authorized redirect URIs)**」→ 填這裡，新增兩個（本機 + 雲端）：
    ```
    http://localhost:8501/oauth2callback
    https://你的app名稱.streamlit.app/oauth2callback
@@ -119,6 +121,7 @@ python -c "import secrets; print(secrets.token_hex(32))"
 
 | 症狀 | 原因與解法 |
 |------|-----------|
+| `來源無效：URI 不得包含路徑或以「/」結尾` | 把含 `/oauth2callback` 的網址填錯到「**已授權的 JavaScript 來源**」欄了。該欄只收網域（無路徑）。請改填到下方「**已授權的重新導向 URI**」欄；JavaScript 來源欄留空即可。 |
 | `Error 400: redirect_uri_mismatch` | Google 憑證裡的重新導向 URI 與 secrets 的 `redirect_uri` 不一致。逐字比對：https、結尾 `/oauth2callback`、無多餘斜線。 |
 | `Access blocked: app not verified` / 無法登入 | 同意畫面在「測試中」，但登入帳號不在測試使用者清單。回步驟 1-2 加入該帳號。 |
 | 登入後仍被擋「未獲授權」 | 該 email 不在 `allowed_emails`。加入清單（大小寫不拘）。 |
