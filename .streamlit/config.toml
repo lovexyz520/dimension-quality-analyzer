@@ -1,2 +1,14 @@
 [server]
 headless = true
+# 限制上傳大小（MB），避免超大檔案把雲端記憶體撐爆
+maxUploadSize = 50
+# 關閉靜態檔案服務，減少不必要的暴露面
+enableStaticServing = false
+
+[browser]
+# 不回傳使用統計，保護隱私
+gatherUsageStats = false
+
+[client]
+# 正式環境不對使用者顯示 Python 例外細節（避免資訊外洩）
+showErrorDetails = "none"

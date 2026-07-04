@@ -336,7 +336,7 @@ I-MR 控制圖用於監控製程穩定性：
 2. `mold`（模次）
 3. 維度內的行索引（fallback）
 
-## 部署
+## 部署與安全性
 
 本應用設計用於 Streamlit Cloud 部署：
 
@@ -344,3 +344,21 @@ I-MR 控制圖用於監控製程穩定性：
 2. 連接 Streamlit Cloud
 3. 選擇 `streamlit_app.py` 作為主檔案
 4. 自動從 `requirements.txt` 安裝依賴
+
+### 登入驗證（Google OIDC）
+
+- 以 Streamlit 內建 `st.login` / `st.user` / `st.logout` 實作（需 `Authlib>=1.3.2`、Streamlit ≥1.42）
+- 閘門在 `streamlit_app.py` 的 `_require_auth()`，於 `set_page_config` 後、其餘 UI 前呼叫
+- **設計為「未設定即不啟用」**：secrets 無 `[auth]` 區塊時不強制登入（本機開發用）；
+  設定 `[auth]` 後自動強制 Google 登入
+- `allowed_emails`（secrets 頂層清單）為白名單，只放行指定帳號（大小寫不敏感）；留空則任何 Google 登入者皆可進入
+- 設定範本見 `.streamlit/secrets.toml.example`；正式部署時把 `[auth]` 與金鑰貼到
+  Streamlit Cloud 的 App settings → Secrets，切勿放進 repo
+
+### 安全性設定
+
+- `.streamlit/config.toml`：`maxUploadSize=50`、`showErrorDetails="none"`、
+  `gatherUsageStats=false`、`enableStaticServing=false`
+- `secrets.toml`（含金鑰）與客戶量測 Excel（`*.xlsm`/`*.xlsx`）皆已 gitignore，不進版控
+- 機密資料考量：Community Cloud 為第三方（美國）主機、AI 報告會將摘要送至 Google；
+  機密批次建議只用「離線結構化摘要」，或改內網自架

@@ -331,10 +331,54 @@ def _get_grouping_details(raw_df: pd.DataFrame) -> dict:
 
 
 # ============================================================================
+# Authentication (Google OIDC via st.login)
+# ============================================================================
+
+def _require_auth() -> None:
+    """Gate the app behind Google login when [auth] is configured in secrets.
+
+    設計為「未設定即不啟用」：本機開發（secrets 無 [auth]）不需登入；
+    部署時在 Streamlit Cloud 的 Secrets 設好 [auth] 即自動強制登入。
+    可另設 allowed_emails 白名單，只放行指定 Google 帳號。
+    """
+    try:
+        auth_configured = "auth" in st.secrets
+    except Exception:
+        auth_configured = False
+    if not auth_configured:
+        return  # 本機開發或未設定登入
+
+    user = getattr(st, "user", None)
+    if user is None or not getattr(user, "is_logged_in", False):
+        st.title("盒鬚圖分析工具")
+        st.info("本系統含機密量測資料，請先登入。")
+        st.button("使用 Google 帳號登入", on_click=st.login, type="primary")
+        st.stop()
+
+    # 白名單檢查（若有設定）
+    try:
+        allowed = [str(e).strip().lower() for e in st.secrets.get("allowed_emails", [])]
+    except Exception:
+        allowed = []
+    email = (getattr(user, "email", "") or "").strip().lower()
+    if allowed and email not in allowed:
+        st.error(f"帳號 {email or '（未知）'} 未獲授權使用本系統，請聯絡管理員。")
+        st.button("登出", on_click=st.logout)
+        st.stop()
+
+    # 已登入且授權：側欄顯示身分與登出
+    with st.sidebar:
+        st.caption(f"👤 已登入：{getattr(user, 'name', None) or email}")
+        st.button("登出", on_click=st.logout, key="_logout_btn")
+
+
+# ============================================================================
 # Streamlit App
 # ============================================================================
 
 st.set_page_config(page_title="Box-and-Whisker Plot", layout="wide")
+
+_require_auth()
 
 st.title("盒鬚圖分析工具")
 st.caption("上傳單一或多個 Excel，支援自動分組或全部合併，每個維度一張圖。")
