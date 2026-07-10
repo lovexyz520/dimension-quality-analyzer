@@ -12,7 +12,8 @@ Dimension Quality Analyzer 是一個製造業品質分析 Web 應用程式，用
 - **Streamlit** - Web 應用框架
 - **Pandas** - 數據處理
 - **Plotly** - 互動式圖表
-- **openpyxl** - Excel 讀寫
+- **openpyxl** - Excel 讀寫（.xlsx/.xlsm）
+- **xlrd** - 舊版 Excel 讀取（.xls）
 - **NumPy** - 數值計算
 - **SciPy** - 統計檢定（Shapiro-Wilk 常態性檢定、常態分位數）
 - **Kaleido** - Plotly 圖表轉 PNG
@@ -25,7 +26,8 @@ dimension-quality-analyzer/
 ├── streamlit_app.py          # UI 主程式
 ├── core/                     # 核心模組
 │   ├── __init__.py           # 模組匯出
-│   ├── excel_parser.py       # Excel 解析
+│   ├── mapping.py            # 欄位對映（別名偵測 + 手動對映）
+│   ├── excel_parser.py       # Excel/CSV 解析
 │   ├── statistics.py         # 統計計算
 │   ├── visualization.py      # 圖表繪製
 │   ├── export.py             # 匯出功能
@@ -40,18 +42,34 @@ dimension-quality-analyzer/
 
 ## 模組架構
 
+### core/mapping.py
+描述「哪一欄是什麼」，讓任意排版的量測報表都能對映到標準 schema。
+
+| 函數 / 類別 | 功能 |
+|------|------|
+| `normalize_label()` | 正規化欄名（去空白/標點、轉小寫；保留 +/-） |
+| `*_ALIASES` | 各欄位類別的別名表（維度名、標稱、公差、上下限、量測值、穴號…） |
+| `_match_col()` | 依別名找欄位（先精確、後子字串；短 ASCII 別名僅精確） |
+| `detect_header_row()` | 命中 ≥2 個別名類別的列即視為標題列 |
+| `ColumnMapping` | 對映設定 dataclass，可序列化成 JSON 重複使用 |
+| `ColumnMapping.validate()` | 回傳阻擋解析的問題清單 |
+| `ColumnMapping.has_spec()` | 是否足以推導規格上下限 |
+| `detect_mapping()` | 自動猜測對映；認不出標題列時回傳 None |
+
 ### core/excel_parser.py
 | 函數 | 功能 |
 |------|------|
-| `_find_header_row()` | 尋找含「規格」與「球標」的標題列 |
-| `_find_col_index()` | 尋找指定標籤的欄位索引 |
-| `_clean_cell()` | 清理儲存格值 |
-| `_detect_focus_sheet()` | 自動偵測「重點尺寸」工作表 |
+| `_clean_cell()` / `_clean_label()` | 清理儲存格值 |
 | `_detect_arrangement_from_mold_labels()` | 偵測資料排列方式 (CAV.X / 第X模) |
 | `_parse_cavity_from_cav_label()` | 從 CAV.X 格式解析穴號 |
 | `_extract_mold_and_pos()` | 提取模次與位置資訊 |
-| `parse_focus_dimensions()` | 解析 Excel 數據為標準格式 |
-| `load_excel()` | Excel 檔案載入入口 |
+| `_spec_bounds()` | 由上下限或標稱±公差推導 (nominal, upper, lower) |
+| `apply_mapping()` | **唯一的套用點**：依 ColumnMapping 轉成標準 schema |
+| `parse_focus_dimensions()` | `detect_mapping()` + `apply_mapping()` |
+| `load_raw_sheets()` | 讀取所有工作表原始內容（供對映精靈預覽） |
+| `detect_best_sheet()` | 挑最可解析的工作表 |
+| `load_with_mapping()` | 依使用者確認的對映解析 |
+| `load_excel()` | 自動偵測並解析（載入入口） |
 
 ### core/statistics.py
 | 函數 | 功能 |
@@ -189,14 +207,51 @@ uv sync
 pip install -r requirements.txt
 ```
 
-## Excel 解析邏輯
+## 資料解析（欄位對映）
 
-應用程式預期的 Excel 結構：
+解析分兩步，自動偵測與手動對映**共用同一個 `apply_mapping()`**，避免兩套邏輯漂移：
 
-1. 工作表名稱含「重點尺寸」，或內容含「規格」+「球標」欄位
-2. 標題列格式：`[空] | 規格 | 正公差 | 負公差 | 圖示位置 | 球標 | 量測1 | 量測2 | ... | 量測方式`
-3. 數據從標題列 +2 行開始
-4. 量測值位於「球標」與「量測方式」欄位之間
+```
+detect_mapping(raw) → ColumnMapping → apply_mapping(raw, mapping) → 標準 schema
+                          ↑
+                   使用者可在 UI 覆寫
+```
+
+### 支援的檔案格式
+`.xlsx` / `.xlsm`（openpyxl）、`.xls`（xlrd）、`.csv`（自動嘗試 UTF-8 / Big5 / CP950）
+
+### 支援的排列
+| Layout | 結構 | 典型來源 |
+|--------|------|----------|
+| `wide` | 一列一個尺寸，多欄量測值 | 傳統檢驗報表 |
+| `long` | 一列一筆量測 | CMM / MES / SPC 軟體匯出 |
+
+長表沒有「組別」欄時，以模次填入 `mold`、以穴號填入 `pos_in_mold`，
+否則 `assign_groups_vectorized()` 會判定為單模次，整份資料塌成一張「合併」圖。
+
+### 欄名別名（不再寫死「規格」「球標」）
+標題列判定為「命中 ≥2 個別名類別的列」，欄位以別名表比對（見 `core/mapping.py`）：
+
+| 類別 | 別名範例 |
+|------|----------|
+| 維度名稱 | 球標、項目、尺寸、特性、Item、Dimension |
+| 標稱值 | 規格、標稱尺寸、基準值、Nominal、Target |
+| 公差 | 正公差/負公差、上公差/下公差、Tol+/Tol- |
+| 規格上下限 | 上限/下限、USL/LSL、Max/Min |
+| 量測值（長表） | 量測值、實測值、Value、Actual |
+| 穴號 / 模次 | 穴號、Cavity / 模次、Cycle、Shot |
+
+偵測順序上「上下限」先於「標稱值」，否則「規格上限」會被「規格」搶走。
+量測欄的起點是**所有已對映欄位的右界**，不是維度名欄——品名欄若排在規格欄左邊，
+規格欄會被誤讀成量測值。
+
+### 規格來源
+優先用直接給的上下限；否則 `nominal ± 公差`。兩者皆無時 `nominal/upper/lower` 為 NaN，
+Cpk、超規格點、標準化偏離自動略過，盒鬚圖與 SPC 仍可使用（優雅降級）。
+
+### 對映精靈
+自動偵測失敗時，UI 直接顯示原始表格預覽與欄位選單，讓使用者指定標題列、資料起始列、
+維度名稱欄、規格來源與量測值欄。對映可匯出成 `column_mapping.json` 重複使用。
 
 ## 注意事項
 

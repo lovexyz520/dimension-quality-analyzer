@@ -25,6 +25,13 @@ except Exception:
 
 from core import (
     load_excel,
+    load_raw_sheets,
+    load_with_mapping,
+    detect_mapping,
+    apply_mapping,
+    ColumnMapping,
+    LAYOUT_WIDE,
+    LAYOUT_LONG,
     calc_out_of_spec,
     pick_spec_values,
     stats_table,
@@ -85,9 +92,29 @@ PLOTLY_CONFIG = {
 # 只有資料真正改變時才重算。
 # ============================================================================
 
+class _NamedBytes(io.BytesIO):
+    """BytesIO with a .name — the parser dispatches on file extension."""
+
+    def __init__(self, content: bytes, name: str):
+        super().__init__(content)
+        self.name = name
+
+
 @st.cache_data(show_spinner=False)
 def _load_excel_cached(content: bytes, name: str):
-    return load_excel(io.BytesIO(content))
+    return load_excel(_NamedBytes(content, name))
+
+
+@st.cache_data(show_spinner=False)
+def _raw_sheets_cached(content: bytes, name: str):
+    return load_raw_sheets(_NamedBytes(content, name))
+
+
+@st.cache_data(show_spinner=False)
+def _load_with_mapping_cached(content: bytes, name: str, mapping_json: str):
+    """mapping 以 JSON 字串傳入，因為 dataclass 不可 hash。"""
+    mapping = ColumnMapping.from_dict(json.loads(mapping_json))
+    return load_with_mapping(_NamedBytes(content, name), mapping)
 
 
 @st.cache_data(show_spinner=False)
@@ -383,6 +410,228 @@ def _require_auth() -> None:
 
 
 # ============================================================================
+# Column mapping wizard
+# 自動偵測認不出欄位時（欄名與內建別名都對不上），讓使用者直接指定哪一欄是什麼。
+# ============================================================================
+
+SPEC_TOLERANCE = "標稱值 + 正負公差"
+SPEC_LIMITS = "直接給上限 / 下限"
+SPEC_NONE = "沒有規格（僅畫圖與 SPC）"
+
+
+def _col_label(raw: pd.DataFrame, header_row: int, idx) -> str:
+    if idx is None:
+        return "（不使用）"
+    text = ""
+    if 0 <= header_row < len(raw) and idx < raw.shape[1]:
+        text = str(raw.iloc[header_row, idx]).strip()
+    if text in ("", "nan", "None"):
+        text = "（空白）"
+    return f"{idx}: {text}"
+
+
+def _col_select(label, raw, header_row, default, key, help=None):
+    options = [None] + list(range(raw.shape[1]))
+    index = options.index(default) if default in options else 0
+    return st.selectbox(
+        label, options, index=index, key=key, help=help,
+        format_func=lambda i: _col_label(raw, header_row, i),
+    )
+
+
+def _build_mapping_form(raw: pd.DataFrame, sheet: str, fname: str) -> ColumnMapping:
+    """Render the mapping controls for one sheet and return the resulting mapping."""
+    guess = detect_mapping(raw, sheet_name=sheet) or ColumnMapping(sheet_name=sheet)
+    k = lambda field: f"map_{fname}_{sheet}_{field}"  # noqa: E731
+
+    layout = st.radio(
+        "資料排列",
+        [LAYOUT_WIDE, LAYOUT_LONG],
+        index=0 if guess.layout == LAYOUT_WIDE else 1,
+        horizontal=True,
+        key=k("layout"),
+        format_func=lambda v: (
+            "寬表：一列一個尺寸，多欄量測值" if v == LAYOUT_WIDE
+            else "長表：一列一筆量測（CMM / MES 匯出）"
+        ),
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        header_row = st.number_input(
+            "標題列（第幾列，從 0 起算）", 0, max(len(raw) - 1, 0),
+            value=min(guess.header_row, max(len(raw) - 1, 0)), key=k("header"),
+        )
+    with c2:
+        data_start = st.number_input(
+            "資料起始列", 0, max(len(raw) - 1, 0),
+            value=min(max(guess.data_start_row, header_row + 1), max(len(raw) - 1, 0)),
+            key=k("start"),
+        )
+    with c3:
+        label_row = None
+        if layout == LAYOUT_WIDE:
+            use_label = st.checkbox(
+                "有量測欄標籤列", value=guess.label_row is not None, key=k("uselabel"),
+                help="標題列下方標示穴號/模次的那一列，例如 1 2 3 4",
+            )
+            if use_label:
+                label_row = st.number_input(
+                    "標籤列", 0, max(len(raw) - 1, 0),
+                    value=min(guess.label_row if guess.label_row is not None else header_row + 1,
+                              max(len(raw) - 1, 0)),
+                    key=k("labelrow"),
+                )
+
+    dimension_cols = st.multiselect(
+        "維度名稱欄位（可多選，會以空白串接）",
+        list(range(raw.shape[1])),
+        default=[c for c in guess.dimension_cols if c < raw.shape[1]],
+        key=k("dims"),
+        format_func=lambda i: _col_label(raw, header_row, i),
+    )
+
+    if guess.upper_col is not None or guess.lower_col is not None:
+        spec_default = SPEC_LIMITS
+    elif guess.nominal_col is not None:
+        spec_default = SPEC_TOLERANCE
+    else:
+        spec_default = SPEC_NONE
+
+    spec_mode = st.radio(
+        "規格來源",
+        [SPEC_TOLERANCE, SPEC_LIMITS, SPEC_NONE],
+        index=[SPEC_TOLERANCE, SPEC_LIMITS, SPEC_NONE].index(spec_default),
+        horizontal=True,
+        key=k("specmode"),
+        help="沒有規格時仍可畫盒鬚圖與 SPC，但 Cpk、超規格、標準化偏離會自動略過。",
+    )
+
+    nominal_col = plus_col = minus_col = upper_col = lower_col = None
+    if spec_mode == SPEC_TOLERANCE:
+        s1, s2, s3 = st.columns(3)
+        with s1:
+            nominal_col = _col_select("標稱值欄", raw, header_row, guess.nominal_col, k("nom"))
+        with s2:
+            plus_col = _col_select("正公差欄", raw, header_row, guess.plus_col, k("plus"))
+        with s3:
+            minus_col = _col_select("負公差欄", raw, header_row, guess.minus_col, k("minus"))
+    elif spec_mode == SPEC_LIMITS:
+        s1, s2, s3 = st.columns(3)
+        with s1:
+            upper_col = _col_select("上限欄 (USL)", raw, header_row, guess.upper_col, k("usl"))
+        with s2:
+            lower_col = _col_select("下限欄 (LSL)", raw, header_row, guess.lower_col, k("lsl"))
+        with s3:
+            nominal_col = _col_select(
+                "標稱值欄（選填）", raw, header_row, guess.nominal_col, k("nom2"),
+                help="留空時以 (上限 + 下限) / 2 當中值",
+            )
+
+    meas_cols, value_col = [], None
+    cavity_col = cycle_col = mold_col = None
+    if layout == LAYOUT_WIDE:
+        meas_cols = st.multiselect(
+            "量測值欄位（可多選）",
+            list(range(raw.shape[1])),
+            default=[c for c in guess.meas_cols if c < raw.shape[1]],
+            key=k("meas"),
+            format_func=lambda i: _col_label(raw, header_row, i),
+        )
+    else:
+        l1, l2, l3, l4 = st.columns(4)
+        with l1:
+            value_col = _col_select("量測值欄", raw, header_row, guess.value_col, k("val"))
+        with l2:
+            cavity_col = _col_select("穴號欄（選填）", raw, header_row, guess.cavity_col, k("cav"))
+        with l3:
+            cycle_col = _col_select("模次欄（選填）", raw, header_row, guess.cycle_col, k("cyc"))
+        with l4:
+            mold_col = _col_select("組別欄（選填）", raw, header_row, guess.mold_col, k("mold"))
+
+    return ColumnMapping(
+        layout=layout,
+        sheet_name=sheet,
+        header_row=int(header_row),
+        data_start_row=int(data_start),
+        label_row=int(label_row) if label_row is not None else None,
+        dimension_cols=list(dimension_cols),
+        nominal_col=nominal_col,
+        plus_col=plus_col,
+        minus_col=minus_col,
+        upper_col=upper_col,
+        lower_col=lower_col,
+        meas_cols=list(meas_cols),
+        value_col=value_col,
+        cavity_col=cavity_col,
+        cycle_col=cycle_col,
+        mold_col=mold_col,
+    )
+
+
+def _render_mapping_wizard(files, targets: set) -> None:
+    """Let the user define a mapping per file, and persist it in session state."""
+    saved = st.session_state.setdefault("mappings", {})
+
+    for file in files:
+        if file.name not in targets:
+            continue
+
+        with st.expander(f"📄 {file.name}", expanded=file.name not in saved):
+            sheets, err = _raw_sheets_cached(file.getvalue(), file.name)
+            if err:
+                st.error(err)
+                continue
+
+            sheet_names = list(sheets)
+            sheet = st.selectbox("工作表", sheet_names, key=f"ws_{file.name}")
+            raw = sheets[sheet]
+
+            st.caption("原始內容預覽（欄位編號即下方選單的編號）")
+            preview = raw.head(15).copy()
+            preview.columns = [str(c) for c in range(raw.shape[1])]
+            st.dataframe(preview, use_container_width=True)
+
+            mapping = _build_mapping_form(raw, sheet, file.name)
+
+            problems = mapping.validate()
+            if problems:
+                st.warning("尚未完成：" + "；".join(problems))
+            else:
+                if not mapping.has_spec():
+                    st.info("未設定規格：Cpk、超規格點與標準化偏離將略過，盒鬚圖與 SPC 仍可使用。")
+                try:
+                    preview_df = apply_mapping(raw, mapping)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"套用失敗：{exc}")
+                    preview_df = pd.DataFrame()
+
+                if preview_df.empty:
+                    st.error("依目前設定解析不到任何量測值，請檢查資料起始列與量測值欄位。")
+                else:
+                    st.success(
+                        f"可解析 {len(preview_df)} 筆量測、"
+                        f"{preview_df['dimension'].nunique()} 個維度"
+                    )
+                    st.dataframe(preview_df.head(6), use_container_width=True)
+                    if st.button("✅ 套用此對映", key=f"apply_{file.name}", type="primary"):
+                        saved[file.name] = mapping.to_dict()
+                        st.rerun()
+
+    if saved:
+        st.download_button(
+            "⬇️ 匯出對映設定 (JSON)",
+            data=json.dumps(saved, ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name="column_mapping.json",
+            mime="application/json",
+            help="下次上傳同格式檔案時匯入即可，不必重設",
+        )
+        if st.button("🗑️ 清除所有對映設定"):
+            st.session_state["mappings"] = {}
+            st.rerun()
+
+
+# ============================================================================
 # Streamlit App
 # ============================================================================
 
@@ -394,14 +643,46 @@ st.title("盒鬚圖分析工具")
 st.caption("上傳單一或多個 Excel，支援自動分組或全部合併，每個維度一張圖。")
 
 uploaded_files = st.file_uploader(
-    "上傳 Excel 檔案 (xlsm/xlsx)",
-    type=["xlsm", "xlsx"],
+    "上傳量測檔案 (xlsm/xlsx/xls/csv)",
+    type=["xlsm", "xlsx", "xls", "csv"],
     accept_multiple_files=True,
 )
 
 if not uploaded_files:
-    st.info("請先上傳 Excel 檔案")
+    st.info("請先上傳量測檔案")
     st.stop()
+
+# 對映設定：自動偵測認不出欄名時，讓使用者手動指定
+st.session_state.setdefault("mappings", {})
+
+with st.expander("⚙️ 欄位對映設定（欄名與內建格式不同時使用）", expanded=False):
+    st.caption(
+        "系統會自動辨識常見欄名（規格 / 標稱尺寸 / Nominal、球標 / 項目 / Item、"
+        "正負公差或上下限…）。若你的報表欄名不在其中，或需要覆寫自動判斷，在這裡指定。"
+    )
+    cfg_upload = st.file_uploader(
+        "匯入對映設定 (JSON)", type=["json"], key="mapping_cfg_upload",
+        help="套用先前匯出的欄位對映",
+    )
+    if cfg_upload is not None:
+        sig = f"{cfg_upload.name}_{cfg_upload.size}"
+        if st.session_state.get("_mapping_cfg_applied") != sig:
+            try:
+                st.session_state["mappings"].update(
+                    json.loads(cfg_upload.getvalue().decode("utf-8"))
+                )
+                st.session_state["_mapping_cfg_applied"] = sig
+                st.success("已匯入對映設定")
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"對映設定讀取失敗：{exc}")
+
+    manual_mapping = st.checkbox(
+        "手動對映欄位", value=False,
+        help="勾選後可為每個檔案指定維度名稱欄、規格欄與量測值欄",
+    )
+    if manual_mapping:
+        _render_mapping_wizard(uploaded_files, {f.name for f in uploaded_files})
 
 # Analysis stage — 決定整體解讀框架（不改變統計計算，只改變重點與報告語氣）
 analysis_stage = st.radio(
@@ -423,11 +704,22 @@ auto_range = st.checkbox("依規格/數據自動縮放", value=True)
 all_frames = []
 errors = []
 
+failed_files = []
+saved_mappings = st.session_state["mappings"]
+
 load_progress = st.progress(0, text="正在載入檔案...")
 for i, file in enumerate(uploaded_files):
-    df, err = _load_excel_cached(file.getvalue(), file.name)
+    mapping_dict = saved_mappings.get(file.name)
+    if mapping_dict:
+        df, err = _load_with_mapping_cached(
+            file.getvalue(), file.name, json.dumps(mapping_dict, sort_keys=True)
+        )
+    else:
+        df, err = _load_excel_cached(file.getvalue(), file.name)
+
     if err:
         errors.append(f"{file.name}: {err}")
+        failed_files.append(file.name)
         continue
     df["file"] = file.name
     all_frames.append(df)
@@ -439,8 +731,12 @@ if errors:
     for msg in errors:
         st.write("-", msg)
 
+# 自動辨識失敗時直接把對映精靈端出來，而不是只留一句錯誤訊息
+if failed_files and not manual_mapping:
+    st.info("👇 這些檔案的欄名與內建格式不同，請在下方指定哪一欄是什麼")
+    _render_mapping_wizard(uploaded_files, set(failed_files))
+
 if not all_frames:
-    st.error("沒有可用資料")
     st.stop()
 
 raw = pd.concat(all_frames, ignore_index=True)
