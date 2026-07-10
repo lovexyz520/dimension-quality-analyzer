@@ -13,6 +13,7 @@ from .mapping import (
     LAYOUT_WIDE,
     ColumnMapping,
     detect_mapping,
+    infer_rows,
 )
 from .statistics import (
     NELSON_RULE_DESCRIPTIONS,
@@ -90,6 +91,7 @@ __all__ = [
     "LAYOUT_WIDE",
     "ColumnMapping",
     "detect_mapping",
+    "infer_rows",
     # Statistics
     "NELSON_RULE_DESCRIPTIONS",
     "calc_out_of_spec",

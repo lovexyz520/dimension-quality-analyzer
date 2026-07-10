@@ -29,6 +29,7 @@ from core import (
     load_with_mapping,
     detect_mapping,
     apply_mapping,
+    infer_rows,
     ColumnMapping,
     LAYOUT_WIDE,
     LAYOUT_LONG,
@@ -569,6 +570,185 @@ def _build_mapping_form(raw: pd.DataFrame, sheet: str, fname: str) -> ColumnMapp
     )
 
 
+PREVIEW_ROWS = 25
+
+
+def _col_names(raw: pd.DataFrame, header_row=None) -> list:
+    """Column captions for the preview table: '3｜標稱尺寸'."""
+    names = []
+    for i in range(raw.shape[1]):
+        text = ""
+        if header_row is not None and 0 <= header_row < len(raw):
+            text = str(raw.iloc[header_row, i]).strip()
+        if text in ("", "nan", "None"):
+            text = "（空白）" if header_row is not None else ""
+        names.append(f"{i}｜{text}" if text else f"欄 {i}")
+    return names
+
+
+def _preview_table(raw: pd.DataFrame, header_row=None) -> pd.DataFrame:
+    preview = raw.head(PREVIEW_ROWS).copy()
+    preview.columns = _col_names(raw, header_row)
+    return preview.fillna("").astype(str)
+
+
+def _pick_rows(raw, header_row, key, mode="single-row"):
+    """Show the preview and return the row indices the user clicked."""
+    event = st.dataframe(
+        _preview_table(raw, header_row),
+        use_container_width=True, height=340,
+        on_select="rerun", selection_mode=mode, key=key,
+    )
+    return list(event.selection.rows)
+
+
+def _pick_cols(raw, header_row, key, mode="multi-column"):
+    """Show the preview and return the column indices the user clicked."""
+    names = _col_names(raw, header_row)
+    event = st.dataframe(
+        _preview_table(raw, header_row),
+        use_container_width=True, height=340,
+        on_select="rerun", selection_mode=mode, key=key,
+    )
+    return sorted(names.index(c) for c in event.selection.columns if c in names)
+
+
+def _spec_picker(raw, header_row, guess, fname):
+    """Spec columns, chosen by name rather than by index."""
+    k = lambda f: f"click_{fname}_{f}"  # noqa: E731
+
+    if guess.upper_col is not None or guess.lower_col is not None:
+        default = SPEC_LIMITS
+    elif guess.nominal_col is not None:
+        default = SPEC_TOLERANCE
+    else:
+        default = SPEC_NONE
+
+    mode = st.radio(
+        "這份報表的規格怎麼給？",
+        [SPEC_TOLERANCE, SPEC_LIMITS, SPEC_NONE],
+        index=[SPEC_TOLERANCE, SPEC_LIMITS, SPEC_NONE].index(default),
+        key=k("specmode"),
+        help="沒有規格也能用，只是 Cpk、超規格點與標準化偏離會略過。",
+    )
+
+    cols = dict(nominal_col=None, plus_col=None, minus_col=None, upper_col=None, lower_col=None)
+    if mode == SPEC_TOLERANCE:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            cols["nominal_col"] = _col_select("標稱值（中間值）", raw, header_row, guess.nominal_col, k("nom"))
+        with c2:
+            cols["plus_col"] = _col_select("正公差", raw, header_row, guess.plus_col, k("plus"))
+        with c3:
+            cols["minus_col"] = _col_select("負公差", raw, header_row, guess.minus_col, k("minus"))
+    elif mode == SPEC_LIMITS:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            cols["upper_col"] = _col_select("上限 (USL)", raw, header_row, guess.upper_col, k("usl"))
+        with c2:
+            cols["lower_col"] = _col_select("下限 (LSL)", raw, header_row, guess.lower_col, k("lsl"))
+        with c3:
+            cols["nominal_col"] = _col_select(
+                "標稱值（選填）", raw, header_row, guess.nominal_col, k("nom2"),
+                help="留空時以 (上限 + 下限) / 2 當中值",
+            )
+    return cols
+
+
+def _render_click_wizard(raw: pd.DataFrame, sheet: str, fname: str) -> ColumnMapping:
+    """Three clicks: header row, name column(s), measurement column(s).
+
+    資料起始列與標籤列由 infer_rows() 推導，不讓使用者去數列號。
+    """
+    guess = detect_mapping(raw, sheet_name=sheet) or ColumnMapping(sheet_name=sheet)
+    state = st.session_state.setdefault(f"wiz_{fname}", {})
+
+    layout = st.radio(
+        "資料長什麼樣子？",
+        [LAYOUT_WIDE, LAYOUT_LONG],
+        index=0 if guess.layout == LAYOUT_WIDE else 1,
+        key=f"click_{fname}_layout",
+        format_func=lambda v: (
+            "📊 一列一個尺寸，右邊好幾欄量測值（一般檢驗報表）" if v == LAYOUT_WIDE
+            else "📋 一列一筆量測（CMM / MES 匯出）"
+        ),
+    )
+
+    # --- Step 1：點標題列 ---
+    st.markdown("##### 步驟 1／3　點一下**標題列**（寫著欄位名稱的那一列）")
+    default_header = state.get("header_row", guess.header_row)
+    picked = _pick_rows(raw, None, f"click_{fname}_hdr")
+    header_row = picked[0] if picked else default_header
+    state["header_row"] = header_row
+    st.caption(f"👉 目前選定：**第 {header_row} 列**" + ("（自動判斷）" if not picked else ""))
+
+    st.divider()
+
+    # --- Step 2：點維度名稱欄 ---
+    st.markdown("##### 步驟 2／3　點一下**尺寸名稱**在哪一欄（可多選，會合併成完整名稱）")
+    st.caption("點欄位標題即可選取。表格標題已換成剛才那列的欄名。")
+    picked_dims = _pick_cols(raw, header_row, f"click_{fname}_dim")
+    dimension_cols = picked_dims or [c for c in guess.dimension_cols if c < raw.shape[1]]
+    if dimension_cols:
+        shown = "、".join(_col_names(raw, header_row)[c] for c in dimension_cols)
+        st.caption(f"👉 目前選定：**{shown}**" + ("（自動判斷）" if not picked_dims else ""))
+    else:
+        st.warning("請至少選一欄當作尺寸名稱")
+
+    st.divider()
+
+    # --- Step 3：量測值 + 規格 ---
+    meas_cols, value_col = [], None
+    cavity_col = cycle_col = mold_col = None
+
+    if layout == LAYOUT_WIDE:
+        st.markdown("##### 步驟 3／3　點一下**量測值**在哪幾欄（可多選）")
+        picked_meas = _pick_cols(raw, header_row, f"click_{fname}_meas")
+        meas_cols = picked_meas or [c for c in guess.meas_cols if c < raw.shape[1]]
+        if meas_cols:
+            shown = "、".join(_col_names(raw, header_row)[c] for c in meas_cols)
+            st.caption(f"👉 目前選定：**{shown}**" + ("（自動判斷）" if not picked_meas else ""))
+        else:
+            st.warning("請至少選一欄量測值")
+    else:
+        st.markdown("##### 步驟 3／3　指定量測值與穴號 / 模次欄")
+        st.dataframe(_preview_table(raw, header_row), use_container_width=True, height=240)
+        l1, l2, l3 = st.columns(3)
+        with l1:
+            value_col = _col_select("量測值", raw, header_row, guess.value_col, f"click_{fname}_val")
+        with l2:
+            cavity_col = _col_select("穴號（選填）", raw, header_row, guess.cavity_col, f"click_{fname}_cav")
+        with l3:
+            cycle_col = _col_select("模次（選填）", raw, header_row, guess.cycle_col, f"click_{fname}_cyc")
+        mold_col = guess.mold_col
+
+    st.divider()
+    spec = _spec_picker(raw, header_row, guess, fname)
+
+    if layout == LAYOUT_WIDE:
+        data_start, label_row = infer_rows(raw, header_row, dimension_cols, meas_cols)
+    else:
+        data_start, label_row = header_row + 1, None
+
+    with st.expander("🔧 進階：微調列號（通常不需要）", expanded=False):
+        st.caption(f"自動判斷：資料從第 {data_start} 列開始"
+                   + (f"，第 {label_row} 列是穴號/模次標籤" if label_row is not None else ""))
+        data_start = st.number_input(
+            "資料起始列", 0, max(len(raw) - 1, 0), value=min(data_start, max(len(raw) - 1, 0)),
+            key=f"click_{fname}_start",
+        )
+
+    return ColumnMapping(
+        layout=layout, sheet_name=sheet,
+        header_row=int(header_row), data_start_row=int(data_start),
+        label_row=int(label_row) if label_row is not None else None,
+        dimension_cols=list(dimension_cols),
+        meas_cols=list(meas_cols), value_col=value_col,
+        cavity_col=cavity_col, cycle_col=cycle_col, mold_col=mold_col,
+        **spec,
+    )
+
+
 def _render_mapping_wizard(files, targets: set) -> None:
     """Let the user define a mapping per file, and persist it in session state."""
     saved = st.session_state.setdefault("mappings", {})
@@ -583,17 +763,24 @@ def _render_mapping_wizard(files, targets: set) -> None:
                 st.error(err)
                 continue
 
-            sheet_names = list(sheets)
-            sheet = st.selectbox("工作表", sheet_names, key=f"ws_{file.name}")
+            sheet = st.selectbox("工作表", list(sheets), key=f"ws_{file.name}")
             raw = sheets[sheet]
 
-            st.caption("原始內容預覽（欄位編號即下方選單的編號）")
-            preview = raw.head(15).copy()
-            preview.columns = [str(c) for c in range(raw.shape[1])]
-            st.dataframe(preview, use_container_width=True)
+            ui_mode = st.radio(
+                "設定方式",
+                ["🖱️ 點選模式", "⚙️ 進階模式"],
+                horizontal=True, key=f"uimode_{file.name}",
+                help="點選模式：直接在表格上點列與欄。進階模式：逐項用下拉選單指定。",
+            )
 
-            mapping = _build_mapping_form(raw, sheet, file.name)
+            if ui_mode == "🖱️ 點選模式":
+                mapping = _render_click_wizard(raw, sheet, file.name)
+            else:
+                st.caption("原始內容預覽（欄位編號即下方選單的編號）")
+                st.dataframe(_preview_table(raw, None), use_container_width=True)
+                mapping = _build_mapping_form(raw, sheet, file.name)
 
+            st.divider()
             problems = mapping.validate()
             if problems:
                 st.warning("尚未完成：" + "；".join(problems))
@@ -607,11 +794,12 @@ def _render_mapping_wizard(files, targets: set) -> None:
                     preview_df = pd.DataFrame()
 
                 if preview_df.empty:
-                    st.error("依目前設定解析不到任何量測值，請檢查資料起始列與量測值欄位。")
+                    st.error("依目前設定解析不到任何量測值，請檢查量測值欄位與資料起始列。")
                 else:
                     st.success(
-                        f"可解析 {len(preview_df)} 筆量測、"
-                        f"{preview_df['dimension'].nunique()} 個維度"
+                        f"✅ 可解析 {len(preview_df)} 筆量測、"
+                        f"{preview_df['dimension'].nunique()} 個維度："
+                        + "、".join(preview_df["dimension"].unique()[:5])
                     )
                     st.dataframe(preview_df.head(6), use_container_width=True)
                     if st.button("✅ 套用此對映", key=f"apply_{file.name}", type="primary"):

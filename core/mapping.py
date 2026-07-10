@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 import re
 
 import numpy as np
@@ -246,6 +246,27 @@ def _detect_meas_cols(
     ]
 
 
+def infer_rows(
+    df: pd.DataFrame, header_row: int, dimension_cols: list[int], meas_cols: list[int]
+) -> Tuple[int, Optional[int]]:
+    """由標題列推導 (資料起始列, 量測欄標籤列)。
+
+    資料起始列 = 標題列下方第一列「維度名稱有值 且 量測欄含數字」。
+    其上若還隔了一列，那是量測欄的標籤列（穴號/模次）。
+    """
+    for row in range(header_row + 1, min(len(df), header_row + 6)):
+        has_name = any(
+            str(df.iloc[row, c]).strip() not in ("", "nan", "None")
+            for c in dimension_cols
+            if c < df.shape[1]
+        )
+        if has_name and _numeric_ratio(df, row, meas_cols) > 0:
+            return row, (row - 1 if row > header_row + 1 else None)
+
+    # 找不到就退回原本的固定假設（標題列 +2）
+    return header_row + 2, header_row + 1
+
+
 def _detect_wide(df: pd.DataFrame, header_row: int, mapping: ColumnMapping) -> ColumnMapping:
     header = df.iloc[header_row]
     used: set = set()
@@ -274,23 +295,9 @@ def _detect_wide(df: pd.DataFrame, header_row: int, mapping: ColumnMapping) -> C
     method_col = _match_col(header, METHOD_ALIASES, used)
     mapping.meas_cols = _detect_meas_cols(df, header_row, used, method_col)
 
-    # 資料起始列：標題列下方第一列「維度名稱有值 且 量測欄含數字」。
-    # 其上若還有一列，那是量測欄的標籤列（穴號/模次）。
-    for row in range(header_row + 1, min(len(df), header_row + 6)):
-        has_name = any(
-            str(df.iloc[row, c]).strip() not in ("", "nan", "None")
-            for c in mapping.dimension_cols
-            if c < df.shape[1]
-        )
-        if has_name and _numeric_ratio(df, row, mapping.meas_cols) > 0:
-            mapping.data_start_row = row
-            mapping.label_row = row - 1 if row > header_row + 1 else None
-            break
-    else:
-        # 找不到就退回原本的固定假設（標題列 +2）
-        mapping.data_start_row = header_row + 2
-        mapping.label_row = header_row + 1
-
+    mapping.data_start_row, mapping.label_row = infer_rows(
+        df, header_row, mapping.dimension_cols, mapping.meas_cols
+    )
     return mapping
 
 
