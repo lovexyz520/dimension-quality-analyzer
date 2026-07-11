@@ -1,6 +1,20 @@
 """Core modules for Dimension Quality Analyzer."""
 
-from .excel_parser import load_excel, parse_focus_dimensions
+from .excel_parser import (
+    load_excel,
+    load_raw_sheets,
+    load_with_mapping,
+    detect_best_sheet,
+    apply_mapping,
+    parse_focus_dimensions,
+)
+from .mapping import (
+    LAYOUT_LONG,
+    LAYOUT_WIDE,
+    ColumnMapping,
+    detect_mapping,
+    infer_rows,
+)
 from .statistics import (
     NELSON_RULE_DESCRIPTIONS,
     calc_out_of_spec,
@@ -67,7 +81,17 @@ from .ai_report import (
 __all__ = [
     # Excel parser
     "load_excel",
+    "load_raw_sheets",
+    "load_with_mapping",
+    "detect_best_sheet",
+    "apply_mapping",
     "parse_focus_dimensions",
+    # Column mapping
+    "LAYOUT_LONG",
+    "LAYOUT_WIDE",
+    "ColumnMapping",
+    "detect_mapping",
+    "infer_rows",
     # Statistics
     "NELSON_RULE_DESCRIPTIONS",
     "calc_out_of_spec",

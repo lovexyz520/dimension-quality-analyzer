@@ -25,6 +25,14 @@ except Exception:
 
 from core import (
     load_excel,
+    load_raw_sheets,
+    load_with_mapping,
+    detect_mapping,
+    apply_mapping,
+    infer_rows,
+    ColumnMapping,
+    LAYOUT_WIDE,
+    LAYOUT_LONG,
     calc_out_of_spec,
     pick_spec_values,
     stats_table,
@@ -85,9 +93,29 @@ PLOTLY_CONFIG = {
 # 只有資料真正改變時才重算。
 # ============================================================================
 
+class _NamedBytes(io.BytesIO):
+    """BytesIO with a .name — the parser dispatches on file extension."""
+
+    def __init__(self, content: bytes, name: str):
+        super().__init__(content)
+        self.name = name
+
+
 @st.cache_data(show_spinner=False)
 def _load_excel_cached(content: bytes, name: str):
-    return load_excel(io.BytesIO(content))
+    return load_excel(_NamedBytes(content, name))
+
+
+@st.cache_data(show_spinner=False)
+def _raw_sheets_cached(content: bytes, name: str):
+    return load_raw_sheets(_NamedBytes(content, name))
+
+
+@st.cache_data(show_spinner=False)
+def _load_with_mapping_cached(content: bytes, name: str, mapping_json: str):
+    """mapping 以 JSON 字串傳入，因為 dataclass 不可 hash。"""
+    mapping = ColumnMapping.from_dict(json.loads(mapping_json))
+    return load_with_mapping(_NamedBytes(content, name), mapping)
 
 
 @st.cache_data(show_spinner=False)
@@ -162,6 +190,34 @@ def _figs_to_png_bytes(figs: list, scale: int = 2) -> list:
 # Helper functions for smart grouping
 # ============================================================================
 
+def _natural_key(s):
+    """Natural sort key so #7-2 sorts before #7-10."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(s))]
+
+
+def _expand_range_token(token: str) -> list:
+    """Expand 'A~B' into a list of tags sharing a prefix with a numeric range.
+
+    '#7-1~#7-10' → ['#7-1', ..., '#7-10']. '#7-1~10' also works (右邊只給數字)。
+    無法展開時原樣回傳單一 token。
+    """
+    token = token.strip()
+    if "~" not in token:
+        return [token] if token else []
+
+    left, right = (part.strip() for part in token.split("~", 1))
+    lm = re.search(r"^(.*?)(\d+)\s*$", left)
+    rm = re.search(r"(\d+)\s*$", right)
+    if not lm or not rm:
+        return [token]
+
+    prefix, start = lm.group(1), int(lm.group(2))
+    end = int(rm.group(1))
+    if end < start or end - start > 999:  # 防呆：範圍上限
+        return [token]
+    return [f"{prefix}{i}" for i in range(start, end + 1)]
+
+
 def _analyze_tag_structure(tags: list) -> dict:
     """Analyze the structure of pos_tag labels.
 
@@ -215,6 +271,7 @@ def _generate_cavity_cycle_grouping(
     arrangement: str,
     start_p: int = 1,
     file_name: str = "",
+    tags: list = None,
 ) -> str:
     """Generate grouping rules based on cavity count, cycle count, and arrangement.
 
@@ -246,18 +303,26 @@ def _generate_cavity_cycle_grouping(
     if file_name:
         lines.append(f"# {file_name}")
 
+    # 有提供檔案真正的標籤時，用「索引映射到實際標籤」；否則退回舊的純數字行為。
+    real_tags = sorted(tags, key=_natural_key) if tags else None
+
+    def _tag(index: int):
+        if real_tags is not None:
+            return real_tags[index] if 0 <= index < len(real_tags) else None
+        return str(index + 1)  # 舊行為：1,2,3...
+
     for cavity in range(num_cavities):
         p_num = start_p + cavity
         if arrangement == "cavity_first":
-            # 穴號優先: labels 1,2,3 are cavity 1's cycles 1~3
-            # label = cavity * num_cycles + cycle + 1
-            tags = [cavity * num_cycles + cycle + 1 for cycle in range(num_cycles)]
+            # 穴號優先：連續 num_cycles 個標籤屬同一穴
+            indices = [cavity * num_cycles + cycle for cycle in range(num_cycles)]
         else:
-            # 模次優先: labels 1,2,3,4 are cycle 1's cavities 1~4
-            # label = cycle * num_cavities + cavity + 1
-            tags = [cycle * num_cavities + cavity + 1 for cycle in range(num_cycles)]
+            # 模次優先：每隔 num_cavities 取一個屬同一穴
+            indices = [cycle * num_cavities + cavity for cycle in range(num_cycles)]
 
-        lines.append(f"P{p_num}: {','.join(map(str, tags))}")
+        picked = [t for t in (_tag(i) for i in indices) if t is not None]
+        if picked:
+            lines.append(f"P{p_num}: {','.join(picked)}")
 
     return "\n".join(lines)
 
@@ -383,6 +448,415 @@ def _require_auth() -> None:
 
 
 # ============================================================================
+# Column mapping wizard
+# 自動偵測認不出欄位時（欄名與內建別名都對不上），讓使用者直接指定哪一欄是什麼。
+# ============================================================================
+
+SPEC_TOLERANCE = "標稱值 + 正負公差"
+SPEC_LIMITS = "直接給上限 / 下限"
+SPEC_NONE = "沒有規格（僅畫圖與 SPC）"
+
+
+def _col_label(raw: pd.DataFrame, header_row: int, idx) -> str:
+    if idx is None:
+        return "（不使用）"
+    text = ""
+    if 0 <= header_row < len(raw) and idx < raw.shape[1]:
+        text = str(raw.iloc[header_row, idx]).strip()
+    if text in ("", "nan", "None"):
+        text = "（空白）"
+    return f"{idx}: {text}"
+
+
+def _col_select(label, raw, header_row, default, key, help=None):
+    options = [None] + list(range(raw.shape[1]))
+    index = options.index(default) if default in options else 0
+    return st.selectbox(
+        label, options, index=index, key=key, help=help,
+        format_func=lambda i: _col_label(raw, header_row, i),
+    )
+
+
+def _build_mapping_form(raw: pd.DataFrame, sheet: str, fname: str) -> ColumnMapping:
+    """Render the mapping controls for one sheet and return the resulting mapping."""
+    guess = detect_mapping(raw, sheet_name=sheet) or ColumnMapping(sheet_name=sheet)
+    k = lambda field: f"map_{fname}_{sheet}_{field}"  # noqa: E731
+
+    layout = st.radio(
+        "資料排列",
+        [LAYOUT_WIDE, LAYOUT_LONG],
+        index=0 if guess.layout == LAYOUT_WIDE else 1,
+        horizontal=True,
+        key=k("layout"),
+        format_func=lambda v: (
+            "寬表：一列一個尺寸，多欄量測值" if v == LAYOUT_WIDE
+            else "長表：一列一筆量測（CMM / MES 匯出）"
+        ),
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        header_row = st.number_input(
+            "標題列（第幾列，從 0 起算）", 0, max(len(raw) - 1, 0),
+            value=min(guess.header_row, max(len(raw) - 1, 0)), key=k("header"),
+        )
+    with c2:
+        data_start = st.number_input(
+            "資料起始列", 0, max(len(raw) - 1, 0),
+            value=min(max(guess.data_start_row, header_row + 1), max(len(raw) - 1, 0)),
+            key=k("start"),
+        )
+    with c3:
+        label_row = None
+        if layout == LAYOUT_WIDE:
+            use_label = st.checkbox(
+                "有量測欄標籤列", value=guess.label_row is not None, key=k("uselabel"),
+                help="標題列下方標示穴號/模次的那一列，例如 1 2 3 4",
+            )
+            if use_label:
+                label_row = st.number_input(
+                    "標籤列", 0, max(len(raw) - 1, 0),
+                    value=min(guess.label_row if guess.label_row is not None else header_row + 1,
+                              max(len(raw) - 1, 0)),
+                    key=k("labelrow"),
+                )
+
+    dimension_cols = st.multiselect(
+        "維度名稱欄位（可多選，會以空白串接）",
+        list(range(raw.shape[1])),
+        default=[c for c in guess.dimension_cols if c < raw.shape[1]],
+        key=k("dims"),
+        format_func=lambda i: _col_label(raw, header_row, i),
+    )
+
+    if guess.upper_col is not None or guess.lower_col is not None:
+        spec_default = SPEC_LIMITS
+    elif guess.nominal_col is not None:
+        spec_default = SPEC_TOLERANCE
+    else:
+        spec_default = SPEC_NONE
+
+    spec_mode = st.radio(
+        "規格來源",
+        [SPEC_TOLERANCE, SPEC_LIMITS, SPEC_NONE],
+        index=[SPEC_TOLERANCE, SPEC_LIMITS, SPEC_NONE].index(spec_default),
+        horizontal=True,
+        key=k("specmode"),
+        help="沒有規格時仍可畫盒鬚圖與 SPC，但 Cpk、超規格、標準化偏離會自動略過。",
+    )
+
+    nominal_col = plus_col = minus_col = upper_col = lower_col = None
+    if spec_mode == SPEC_TOLERANCE:
+        s1, s2, s3 = st.columns(3)
+        with s1:
+            nominal_col = _col_select("標稱值欄", raw, header_row, guess.nominal_col, k("nom"))
+        with s2:
+            plus_col = _col_select("正公差欄", raw, header_row, guess.plus_col, k("plus"))
+        with s3:
+            minus_col = _col_select("負公差欄", raw, header_row, guess.minus_col, k("minus"))
+    elif spec_mode == SPEC_LIMITS:
+        s1, s2, s3 = st.columns(3)
+        with s1:
+            upper_col = _col_select("上限欄 (USL)", raw, header_row, guess.upper_col, k("usl"))
+        with s2:
+            lower_col = _col_select("下限欄 (LSL)", raw, header_row, guess.lower_col, k("lsl"))
+        with s3:
+            nominal_col = _col_select(
+                "標稱值欄（選填）", raw, header_row, guess.nominal_col, k("nom2"),
+                help="留空時以 (上限 + 下限) / 2 當中值",
+            )
+
+    meas_cols, value_col = [], None
+    cavity_col = cycle_col = mold_col = None
+    if layout == LAYOUT_WIDE:
+        meas_cols = st.multiselect(
+            "量測值欄位（可多選）",
+            list(range(raw.shape[1])),
+            default=[c for c in guess.meas_cols if c < raw.shape[1]],
+            key=k("meas"),
+            format_func=lambda i: _col_label(raw, header_row, i),
+        )
+    else:
+        l1, l2, l3, l4 = st.columns(4)
+        with l1:
+            value_col = _col_select("量測值欄", raw, header_row, guess.value_col, k("val"))
+        with l2:
+            cavity_col = _col_select("穴號欄（選填）", raw, header_row, guess.cavity_col, k("cav"))
+        with l3:
+            cycle_col = _col_select("模次欄（選填）", raw, header_row, guess.cycle_col, k("cyc"))
+        with l4:
+            mold_col = _col_select("組別欄（選填）", raw, header_row, guess.mold_col, k("mold"))
+
+    return ColumnMapping(
+        layout=layout,
+        sheet_name=sheet,
+        header_row=int(header_row),
+        data_start_row=int(data_start),
+        label_row=int(label_row) if label_row is not None else None,
+        dimension_cols=list(dimension_cols),
+        nominal_col=nominal_col,
+        plus_col=plus_col,
+        minus_col=minus_col,
+        upper_col=upper_col,
+        lower_col=lower_col,
+        meas_cols=list(meas_cols),
+        value_col=value_col,
+        cavity_col=cavity_col,
+        cycle_col=cycle_col,
+        mold_col=mold_col,
+    )
+
+
+PREVIEW_ROWS = 25
+
+
+def _col_names(raw: pd.DataFrame, header_row=None) -> list:
+    """Column captions for the preview table: '3｜標稱尺寸'."""
+    names = []
+    for i in range(raw.shape[1]):
+        text = ""
+        if header_row is not None and 0 <= header_row < len(raw):
+            text = str(raw.iloc[header_row, i]).strip()
+        if text in ("", "nan", "None"):
+            text = "（空白）" if header_row is not None else ""
+        names.append(f"{i}｜{text}" if text else f"欄 {i}")
+    return names
+
+
+def _preview_table(raw: pd.DataFrame, header_row=None) -> pd.DataFrame:
+    preview = raw.head(PREVIEW_ROWS).copy()
+    preview.columns = _col_names(raw, header_row)
+    return preview.fillna("").astype(str)
+
+
+def _pick_rows(raw, header_row, key, mode="single-row"):
+    """Show the preview and return the row indices the user clicked."""
+    event = st.dataframe(
+        _preview_table(raw, header_row),
+        use_container_width=True, height=340,
+        on_select="rerun", selection_mode=mode, key=key,
+    )
+    return list(event.selection.rows)
+
+
+def _pick_cols(raw, header_row, key, mode="multi-column"):
+    """Show the preview and return the column indices the user clicked."""
+    names = _col_names(raw, header_row)
+    event = st.dataframe(
+        _preview_table(raw, header_row),
+        use_container_width=True, height=340,
+        on_select="rerun", selection_mode=mode, key=key,
+    )
+    return sorted(names.index(c) for c in event.selection.columns if c in names)
+
+
+def _spec_picker(raw, header_row, guess, fname):
+    """Spec columns, chosen by name rather than by index."""
+    k = lambda f: f"click_{fname}_{f}"  # noqa: E731
+
+    if guess.upper_col is not None or guess.lower_col is not None:
+        default = SPEC_LIMITS
+    elif guess.nominal_col is not None:
+        default = SPEC_TOLERANCE
+    else:
+        default = SPEC_NONE
+
+    mode = st.radio(
+        "這份報表的規格怎麼給？",
+        [SPEC_TOLERANCE, SPEC_LIMITS, SPEC_NONE],
+        index=[SPEC_TOLERANCE, SPEC_LIMITS, SPEC_NONE].index(default),
+        key=k("specmode"),
+        help="沒有規格也能用，只是 Cpk、超規格點與標準化偏離會略過。",
+    )
+
+    cols = dict(nominal_col=None, plus_col=None, minus_col=None, upper_col=None, lower_col=None)
+    if mode == SPEC_TOLERANCE:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            cols["nominal_col"] = _col_select("標稱值（中間值）", raw, header_row, guess.nominal_col, k("nom"))
+        with c2:
+            cols["plus_col"] = _col_select("正公差", raw, header_row, guess.plus_col, k("plus"))
+        with c3:
+            cols["minus_col"] = _col_select("負公差", raw, header_row, guess.minus_col, k("minus"))
+    elif mode == SPEC_LIMITS:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            cols["upper_col"] = _col_select("上限 (USL)", raw, header_row, guess.upper_col, k("usl"))
+        with c2:
+            cols["lower_col"] = _col_select("下限 (LSL)", raw, header_row, guess.lower_col, k("lsl"))
+        with c3:
+            cols["nominal_col"] = _col_select(
+                "標稱值（選填）", raw, header_row, guess.nominal_col, k("nom2"),
+                help="留空時以 (上限 + 下限) / 2 當中值",
+            )
+    return cols
+
+
+def _render_click_wizard(raw: pd.DataFrame, sheet: str, fname: str) -> ColumnMapping:
+    """Three clicks: header row, name column(s), measurement column(s).
+
+    資料起始列與標籤列由 infer_rows() 推導，不讓使用者去數列號。
+    """
+    guess = detect_mapping(raw, sheet_name=sheet) or ColumnMapping(sheet_name=sheet)
+    state = st.session_state.setdefault(f"wiz_{fname}", {})
+
+    layout = st.radio(
+        "資料長什麼樣子？",
+        [LAYOUT_WIDE, LAYOUT_LONG],
+        index=0 if guess.layout == LAYOUT_WIDE else 1,
+        key=f"click_{fname}_layout",
+        format_func=lambda v: (
+            "📊 一列一個尺寸，右邊好幾欄量測值（一般檢驗報表）" if v == LAYOUT_WIDE
+            else "📋 一列一筆量測（CMM / MES 匯出）"
+        ),
+    )
+
+    # --- Step 1：點標題列 ---
+    st.markdown("##### 步驟 1／3　點一下**標題列**（寫著欄位名稱的那一列）")
+    default_header = state.get("header_row", guess.header_row)
+    picked = _pick_rows(raw, None, f"click_{fname}_hdr")
+    header_row = picked[0] if picked else default_header
+    state["header_row"] = header_row
+    st.caption(f"👉 目前選定：**第 {header_row} 列**" + ("（自動判斷）" if not picked else ""))
+
+    st.divider()
+
+    # --- Step 2：點維度名稱欄 ---
+    st.markdown("##### 步驟 2／3　點一下**尺寸名稱**在哪一欄（可多選，會合併成完整名稱）")
+    st.caption("點欄位標題即可選取。表格標題已換成剛才那列的欄名。")
+    picked_dims = _pick_cols(raw, header_row, f"click_{fname}_dim")
+    dimension_cols = picked_dims or [c for c in guess.dimension_cols if c < raw.shape[1]]
+    if dimension_cols:
+        shown = "、".join(_col_names(raw, header_row)[c] for c in dimension_cols)
+        st.caption(f"👉 目前選定：**{shown}**" + ("（自動判斷）" if not picked_dims else ""))
+    else:
+        st.warning("請至少選一欄當作尺寸名稱")
+
+    st.divider()
+
+    # --- Step 3：量測值 + 規格 ---
+    meas_cols, value_col = [], None
+    cavity_col = cycle_col = mold_col = None
+
+    if layout == LAYOUT_WIDE:
+        st.markdown("##### 步驟 3／3　點一下**量測值**在哪幾欄（可多選）")
+        picked_meas = _pick_cols(raw, header_row, f"click_{fname}_meas")
+        meas_cols = picked_meas or [c for c in guess.meas_cols if c < raw.shape[1]]
+        if meas_cols:
+            shown = "、".join(_col_names(raw, header_row)[c] for c in meas_cols)
+            st.caption(f"👉 目前選定：**{shown}**" + ("（自動判斷）" if not picked_meas else ""))
+        else:
+            st.warning("請至少選一欄量測值")
+    else:
+        st.markdown("##### 步驟 3／3　指定量測值與穴號 / 模次欄")
+        st.dataframe(_preview_table(raw, header_row), use_container_width=True, height=240)
+        l1, l2, l3 = st.columns(3)
+        with l1:
+            value_col = _col_select("量測值", raw, header_row, guess.value_col, f"click_{fname}_val")
+        with l2:
+            cavity_col = _col_select("穴號（選填）", raw, header_row, guess.cavity_col, f"click_{fname}_cav")
+        with l3:
+            cycle_col = _col_select("模次（選填）", raw, header_row, guess.cycle_col, f"click_{fname}_cyc")
+        mold_col = guess.mold_col
+
+    st.divider()
+    spec = _spec_picker(raw, header_row, guess, fname)
+
+    if layout == LAYOUT_WIDE:
+        data_start, label_row = infer_rows(raw, header_row, dimension_cols, meas_cols)
+    else:
+        data_start, label_row = header_row + 1, None
+
+    with st.expander("🔧 進階：微調列號（通常不需要）", expanded=False):
+        st.caption(f"自動判斷：資料從第 {data_start} 列開始"
+                   + (f"，第 {label_row} 列是穴號/模次標籤" if label_row is not None else ""))
+        data_start = st.number_input(
+            "資料起始列", 0, max(len(raw) - 1, 0), value=min(data_start, max(len(raw) - 1, 0)),
+            key=f"click_{fname}_start",
+        )
+
+    return ColumnMapping(
+        layout=layout, sheet_name=sheet,
+        header_row=int(header_row), data_start_row=int(data_start),
+        label_row=int(label_row) if label_row is not None else None,
+        dimension_cols=list(dimension_cols),
+        meas_cols=list(meas_cols), value_col=value_col,
+        cavity_col=cavity_col, cycle_col=cycle_col, mold_col=mold_col,
+        **spec,
+    )
+
+
+def _render_mapping_wizard(files, targets: set) -> None:
+    """Let the user define a mapping per file, and persist it in session state."""
+    saved = st.session_state.setdefault("mappings", {})
+
+    for file in files:
+        if file.name not in targets:
+            continue
+
+        with st.expander(f"📄 {file.name}", expanded=file.name not in saved):
+            sheets, err = _raw_sheets_cached(file.getvalue(), file.name)
+            if err:
+                st.error(err)
+                continue
+
+            sheet = st.selectbox("工作表", list(sheets), key=f"ws_{file.name}")
+            raw = sheets[sheet]
+
+            ui_mode = st.radio(
+                "設定方式",
+                ["🖱️ 點選模式", "⚙️ 進階模式"],
+                horizontal=True, key=f"uimode_{file.name}",
+                help="點選模式：直接在表格上點列與欄。進階模式：逐項用下拉選單指定。",
+            )
+
+            if ui_mode == "🖱️ 點選模式":
+                mapping = _render_click_wizard(raw, sheet, file.name)
+            else:
+                st.caption("原始內容預覽（欄位編號即下方選單的編號）")
+                st.dataframe(_preview_table(raw, None), use_container_width=True)
+                mapping = _build_mapping_form(raw, sheet, file.name)
+
+            st.divider()
+            problems = mapping.validate()
+            if problems:
+                st.warning("尚未完成：" + "；".join(problems))
+            else:
+                if not mapping.has_spec():
+                    st.info("未設定規格：Cpk、超規格點與標準化偏離將略過，盒鬚圖與 SPC 仍可使用。")
+                try:
+                    preview_df = apply_mapping(raw, mapping)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"套用失敗：{exc}")
+                    preview_df = pd.DataFrame()
+
+                if preview_df.empty:
+                    st.error("依目前設定解析不到任何量測值，請檢查量測值欄位與資料起始列。")
+                else:
+                    st.success(
+                        f"✅ 可解析 {len(preview_df)} 筆量測、"
+                        f"{preview_df['dimension'].nunique()} 個維度："
+                        + "、".join(preview_df["dimension"].unique()[:5])
+                    )
+                    st.dataframe(preview_df.head(6), use_container_width=True)
+                    if st.button("✅ 套用此對映", key=f"apply_{file.name}", type="primary"):
+                        saved[file.name] = mapping.to_dict()
+                        st.rerun()
+
+    if saved:
+        st.download_button(
+            "⬇️ 匯出對映設定 (JSON)",
+            data=json.dumps(saved, ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name="column_mapping.json",
+            mime="application/json",
+            help="下次上傳同格式檔案時匯入即可，不必重設",
+        )
+        if st.button("🗑️ 清除所有對映設定"):
+            st.session_state["mappings"] = {}
+            st.rerun()
+
+
+# ============================================================================
 # Streamlit App
 # ============================================================================
 
@@ -394,14 +868,46 @@ st.title("盒鬚圖分析工具")
 st.caption("上傳單一或多個 Excel，支援自動分組或全部合併，每個維度一張圖。")
 
 uploaded_files = st.file_uploader(
-    "上傳 Excel 檔案 (xlsm/xlsx)",
-    type=["xlsm", "xlsx"],
+    "上傳量測檔案 (xlsm/xlsx/xls/csv)",
+    type=["xlsm", "xlsx", "xls", "csv"],
     accept_multiple_files=True,
 )
 
 if not uploaded_files:
-    st.info("請先上傳 Excel 檔案")
+    st.info("請先上傳量測檔案")
     st.stop()
+
+# 對映設定：自動偵測認不出欄名時，讓使用者手動指定
+st.session_state.setdefault("mappings", {})
+
+with st.expander("⚙️ 欄位對映設定（欄名與內建格式不同時使用）", expanded=False):
+    st.caption(
+        "系統會自動辨識常見欄名（規格 / 標稱尺寸 / Nominal、球標 / 項目 / Item、"
+        "正負公差或上下限…）。若你的報表欄名不在其中，或需要覆寫自動判斷，在這裡指定。"
+    )
+    cfg_upload = st.file_uploader(
+        "匯入對映設定 (JSON)", type=["json"], key="mapping_cfg_upload",
+        help="套用先前匯出的欄位對映",
+    )
+    if cfg_upload is not None:
+        sig = f"{cfg_upload.name}_{cfg_upload.size}"
+        if st.session_state.get("_mapping_cfg_applied") != sig:
+            try:
+                st.session_state["mappings"].update(
+                    json.loads(cfg_upload.getvalue().decode("utf-8"))
+                )
+                st.session_state["_mapping_cfg_applied"] = sig
+                st.success("已匯入對映設定")
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"對映設定讀取失敗：{exc}")
+
+    manual_mapping = st.checkbox(
+        "手動對映欄位", value=False,
+        help="勾選後可為每個檔案指定維度名稱欄、規格欄與量測值欄",
+    )
+    if manual_mapping:
+        _render_mapping_wizard(uploaded_files, {f.name for f in uploaded_files})
 
 # Analysis stage — 決定整體解讀框架（不改變統計計算，只改變重點與報告語氣）
 analysis_stage = st.radio(
@@ -423,11 +929,22 @@ auto_range = st.checkbox("依規格/數據自動縮放", value=True)
 all_frames = []
 errors = []
 
+failed_files = []
+saved_mappings = st.session_state["mappings"]
+
 load_progress = st.progress(0, text="正在載入檔案...")
 for i, file in enumerate(uploaded_files):
-    df, err = _load_excel_cached(file.getvalue(), file.name)
+    mapping_dict = saved_mappings.get(file.name)
+    if mapping_dict:
+        df, err = _load_with_mapping_cached(
+            file.getvalue(), file.name, json.dumps(mapping_dict, sort_keys=True)
+        )
+    else:
+        df, err = _load_excel_cached(file.getvalue(), file.name)
+
     if err:
         errors.append(f"{file.name}: {err}")
+        failed_files.append(file.name)
         continue
     df["file"] = file.name
     all_frames.append(df)
@@ -439,8 +956,12 @@ if errors:
     for msg in errors:
         st.write("-", msg)
 
+# 自動辨識失敗時直接把對映精靈端出來，而不是只留一句錯誤訊息
+if failed_files and not manual_mapping:
+    st.info("👇 這些檔案的欄名與內建格式不同，請在下方指定哪一欄是什麼")
+    _render_mapping_wizard(uploaded_files, set(failed_files))
+
 if not all_frames:
-    st.error("沒有可用資料")
     st.stop()
 
 raw = pd.concat(all_frames, ignore_index=True)
@@ -454,12 +975,69 @@ for fname in file_list:
     file_mold_counts[fname] = len(molds)
 
 # Display mode selection
+MODE_BY_MOLD = "按模具群組分組"
+
+# 只有當某檔案存在 ≥2 個不同模具群組（如 AA-1/AA-2）時才提供「按模具群組」模式
+_mold_groupable = False
+if "mold" in raw.columns:
+    _mold_per_file = (
+        raw.assign(_m=raw["mold"].fillna("").astype(str).str.strip())
+        .query("_m != ''")
+        .groupby("file")["_m"].nunique()
+    )
+    _mold_groupable = bool((_mold_per_file >= 2).any())
+
+_mode_options = ["自動分組", "強制分檔顯示", "全部合併成一張圖"]
+if _mold_groupable:
+    _mode_options.insert(1, MODE_BY_MOLD)
+
 mode = st.radio(
     "顯示模式",
-    options=["自動分組", "強制分檔顯示", "全部合併成一張圖"],
+    options=_mode_options,
     index=0,
     horizontal=True,
+    help=(f"「{MODE_BY_MOLD}」：直接依模具群組欄（如 AA-1/AA-2）分組，零輸入。"
+          if _mold_groupable else None),
 )
+
+# 分組方式說明面板：用實際載入的資料舉例，讓使用者知道有哪些做法
+with st.expander("💡 怎麼把資料分組？（4 種方式，挑最順手的）", expanded=False):
+    # 從資料抓真實的模具群組名與標籤來當範例，說明更貼近使用者的檔案
+    _mold_egs = []
+    if "mold" in raw.columns:
+        _mold_egs = sorted(
+            {str(m).strip() for m in raw["mold"].dropna() if str(m).strip()},
+            key=_natural_key,
+        )
+    _tag_egs = []
+    if "pos_tag" in raw.columns:
+        _tag_egs = sorted(
+            {str(t).strip() for t in raw["pos_tag"].dropna() if str(t).strip()},
+            key=_natural_key,
+        )
+
+    g1 = _mold_egs[0] if _mold_egs else "AA-1"
+    g2 = _mold_egs[1] if len(_mold_egs) > 1 else "AA-2"
+    t_first = _tag_egs[0] if _tag_egs else "#7-1"
+    t_mid = _tag_egs[len(_tag_egs) // 2] if len(_tag_egs) > 1 else "#7-11"
+    t_last = _tag_egs[-1] if _tag_egs else "#7-20"
+
+    if _mold_egs:
+        st.caption(f"這批資料的模具群組：{'、'.join(_mold_egs[:8])}"
+                   + ("…" if len(_mold_egs) > 8 else ""))
+
+    st.markdown(
+        f"""
+| 方式 | 怎麼做 |
+|------|--------|
+| **① 零輸入（最推薦）** | 上方顯示模式選「**{MODE_BY_MOLD}**」，什麼都不填，直接依 `{g1}`／`{g2}` 分{'' if _mold_groupable else '（此批資料無模具群組，故未顯示此選項）'} |
+| **② 用群組名** | 勾「使用自訂分組規則」，填 `P1: {g1}` 換行 `P2: {g2}`，兩行搞定 |
+| **③ 範圍寫法** | 自訂分組填 `P1: {t_first}~{t_mid}` 換行 `P2: …~{t_last}`，不用逐一列出 |
+| **④ 快速配置** | 自訂分組內用「快速配置」設穴數／模次數＋穴號或模次優先，會自動產生**這個檔案真正的標籤**規則 |
+"""
+    )
+    st.caption("比對優先序：先看標籤（pos_tag，如 "
+               f"`{t_first}`），對不上再看模具群組（mold，如 `{g1}`）。")
 
 # Custom grouping rules
 use_custom_grouping = st.checkbox("使用自訂分組規則", value=False)
@@ -613,7 +1191,8 @@ if use_custom_grouping:
                 else:
                     arr_key = "cavity_first" if cfg["arrangement"] == "穴號優先" else "cycle_first"
                     part = _generate_cavity_cycle_grouping(
-                        cfg["cavities"], cfg["cycles"], arr_key, current_p, fname
+                        cfg["cavities"], cfg["cycles"], arr_key, current_p, fname,
+                        tags=cfg.get("tags"),
                     )
                     num_groups = cfg["cavities"]
 
@@ -642,9 +1221,11 @@ if use_custom_grouping:
         value=default_value,
         help="格式說明：\n"
              "• 簡單格式：群組名稱: 標籤1,標籤2,...\n"
+             "• 範圍寫法：P1: #7-1~#7-10（自動展開成 #7-1 到 #7-10）\n"
+             "• 用模具群組名：P1: AA-1（直接對應 mold 欄，最省事）\n"
              "• 按檔案分組：先用 # 檔案名稱 指定檔案，接著定義該檔案的分組規則\n"
              "• 當多檔案有相同標籤時，請使用按檔案分組格式避免誤判\n"
-             "• 使用上方「各檔案獨立配置」可針對不同檔案設定不同的分組方式",
+             "• 想零輸入請改用上方顯示模式的「按模具群組分組」",
         height=200,
     )
 
@@ -716,8 +1297,10 @@ def _parse_custom_groups(text: str) -> dict:
         name, values = line.split(":", 1)
         group_name = name.strip()
         for token in values.split(","):
-            tag = token.strip()
-            if tag:
+            for tag in _expand_range_token(token):  # 展開 #7-1~#7-10
+                tag = tag.strip()
+                if not tag:
+                    continue
                 if current_file:
                     # File-specific mapping: (filename, tag) -> group
                     mapping[(current_file, tag)] = group_name
@@ -729,35 +1312,42 @@ def _parse_custom_groups(text: str) -> dict:
 
 
 def _apply_custom_mapping(raw: pd.DataFrame, mapping: dict) -> pd.Series:
-    """Apply custom group mapping considering file-specific rules."""
+    """Apply custom group mapping considering file-specific rules.
+
+    每筆資料的比對鍵優先用 pos_tag（如 #7-1），對不上時再試 mold 群組名
+    （如 AA-1），因此 `P1: AA-1` 這種以群組名分組的寫法也能運作。
+    """
     result = pd.Series("其他", index=raw.index)
-
-    # Check if mapping has file-specific keys (tuples)
     has_file_keys = any(isinstance(k, tuple) for k in mapping.keys())
+    has_mold = "mold" in raw.columns
 
-    if has_file_keys:
-        # File-specific mapping
-        for idx, row in raw.iterrows():
-            file_name = row.get("file", "")
-            tag = row.get("pos_tag", "")
-            if pd.isna(tag):
-                tag = ""
+    def _candidates(row):
+        """依序回傳可用來比對的鍵：pos_tag → mold。"""
+        keys = []
+        for col in ("pos_tag", "mold") if has_mold else ("pos_tag",):
+            val = row.get(col, "")
+            if pd.notna(val) and str(val).strip():
+                keys.append(str(val).strip())
+        return keys
 
-            # Try file-specific key first
-            key = (file_name, str(tag))
+    for idx, row in raw.iterrows():
+        file_name = row.get("file", "")
+        for key in _candidates(row):
+            if has_file_keys and (file_name, key) in mapping:
+                result.loc[idx] = mapping[(file_name, key)]
+                break
             if key in mapping:
                 result.loc[idx] = mapping[key]
-            # Fall back to global key
-            elif str(tag) in mapping:
-                result.loc[idx] = mapping[str(tag)]
-    else:
-        # Simple global mapping
-        result = raw["pos_tag"].map(mapping).fillna("其他")
+                break
 
     return result
 
 
-if use_custom_grouping:
+if mode == MODE_BY_MOLD:
+    # 零輸入：直接依模具群組欄（AA-1/AA-2）分組
+    mold_series = raw["mold"].fillna("").astype(str).str.strip()
+    raw["group"] = mold_series.replace("", "未分組")
+elif use_custom_grouping:
     if "pos_tag" in raw.columns and raw["pos_tag"].notna().any():
         mapping = _parse_custom_groups(custom_groups)
         mapped = _apply_custom_mapping(raw, mapping)
@@ -828,6 +1418,8 @@ with st.expander("📋 查看分組詳情", expanded=False):
         # Display mode info
         if mode == "全部合併成一張圖":
             st.info("模式：全部合併成一張圖（所有數據合併顯示）")
+        elif mode == MODE_BY_MOLD:
+            st.info(f"模式：{MODE_BY_MOLD}（直接依模具群組欄分組）")
         elif mode == "強制分檔顯示":
             st.info("模式：強制分檔顯示（按檔案 + 位置分組）")
         else:
