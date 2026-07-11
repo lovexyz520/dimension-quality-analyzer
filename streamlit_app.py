@@ -190,6 +190,34 @@ def _figs_to_png_bytes(figs: list, scale: int = 2) -> list:
 # Helper functions for smart grouping
 # ============================================================================
 
+def _natural_key(s):
+    """Natural sort key so #7-2 sorts before #7-10."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(s))]
+
+
+def _expand_range_token(token: str) -> list:
+    """Expand 'A~B' into a list of tags sharing a prefix with a numeric range.
+
+    '#7-1~#7-10' → ['#7-1', ..., '#7-10']. '#7-1~10' also works (右邊只給數字)。
+    無法展開時原樣回傳單一 token。
+    """
+    token = token.strip()
+    if "~" not in token:
+        return [token] if token else []
+
+    left, right = (part.strip() for part in token.split("~", 1))
+    lm = re.search(r"^(.*?)(\d+)\s*$", left)
+    rm = re.search(r"(\d+)\s*$", right)
+    if not lm or not rm:
+        return [token]
+
+    prefix, start = lm.group(1), int(lm.group(2))
+    end = int(rm.group(1))
+    if end < start or end - start > 999:  # 防呆：範圍上限
+        return [token]
+    return [f"{prefix}{i}" for i in range(start, end + 1)]
+
+
 def _analyze_tag_structure(tags: list) -> dict:
     """Analyze the structure of pos_tag labels.
 
@@ -243,6 +271,7 @@ def _generate_cavity_cycle_grouping(
     arrangement: str,
     start_p: int = 1,
     file_name: str = "",
+    tags: list = None,
 ) -> str:
     """Generate grouping rules based on cavity count, cycle count, and arrangement.
 
@@ -274,18 +303,26 @@ def _generate_cavity_cycle_grouping(
     if file_name:
         lines.append(f"# {file_name}")
 
+    # 有提供檔案真正的標籤時，用「索引映射到實際標籤」；否則退回舊的純數字行為。
+    real_tags = sorted(tags, key=_natural_key) if tags else None
+
+    def _tag(index: int):
+        if real_tags is not None:
+            return real_tags[index] if 0 <= index < len(real_tags) else None
+        return str(index + 1)  # 舊行為：1,2,3...
+
     for cavity in range(num_cavities):
         p_num = start_p + cavity
         if arrangement == "cavity_first":
-            # 穴號優先: labels 1,2,3 are cavity 1's cycles 1~3
-            # label = cavity * num_cycles + cycle + 1
-            tags = [cavity * num_cycles + cycle + 1 for cycle in range(num_cycles)]
+            # 穴號優先：連續 num_cycles 個標籤屬同一穴
+            indices = [cavity * num_cycles + cycle for cycle in range(num_cycles)]
         else:
-            # 模次優先: labels 1,2,3,4 are cycle 1's cavities 1~4
-            # label = cycle * num_cavities + cavity + 1
-            tags = [cycle * num_cavities + cavity + 1 for cycle in range(num_cycles)]
+            # 模次優先：每隔 num_cavities 取一個屬同一穴
+            indices = [cycle * num_cavities + cavity for cycle in range(num_cycles)]
 
-        lines.append(f"P{p_num}: {','.join(map(str, tags))}")
+        picked = [t for t in (_tag(i) for i in indices) if t is not None]
+        if picked:
+            lines.append(f"P{p_num}: {','.join(picked)}")
 
     return "\n".join(lines)
 
@@ -938,11 +975,29 @@ for fname in file_list:
     file_mold_counts[fname] = len(molds)
 
 # Display mode selection
+MODE_BY_MOLD = "按模具群組分組"
+
+# 只有當某檔案存在 ≥2 個不同模具群組（如 AA-1/AA-2）時才提供「按模具群組」模式
+_mold_groupable = False
+if "mold" in raw.columns:
+    _mold_per_file = (
+        raw.assign(_m=raw["mold"].fillna("").astype(str).str.strip())
+        .query("_m != ''")
+        .groupby("file")["_m"].nunique()
+    )
+    _mold_groupable = bool((_mold_per_file >= 2).any())
+
+_mode_options = ["自動分組", "強制分檔顯示", "全部合併成一張圖"]
+if _mold_groupable:
+    _mode_options.insert(1, MODE_BY_MOLD)
+
 mode = st.radio(
     "顯示模式",
-    options=["自動分組", "強制分檔顯示", "全部合併成一張圖"],
+    options=_mode_options,
     index=0,
     horizontal=True,
+    help=(f"「{MODE_BY_MOLD}」：直接依模具群組欄（如 AA-1/AA-2）分組，零輸入。"
+          if _mold_groupable else None),
 )
 
 # Custom grouping rules
@@ -1097,7 +1152,8 @@ if use_custom_grouping:
                 else:
                     arr_key = "cavity_first" if cfg["arrangement"] == "穴號優先" else "cycle_first"
                     part = _generate_cavity_cycle_grouping(
-                        cfg["cavities"], cfg["cycles"], arr_key, current_p, fname
+                        cfg["cavities"], cfg["cycles"], arr_key, current_p, fname,
+                        tags=cfg.get("tags"),
                     )
                     num_groups = cfg["cavities"]
 
@@ -1126,9 +1182,11 @@ if use_custom_grouping:
         value=default_value,
         help="格式說明：\n"
              "• 簡單格式：群組名稱: 標籤1,標籤2,...\n"
+             "• 範圍寫法：P1: #7-1~#7-10（自動展開成 #7-1 到 #7-10）\n"
+             "• 用模具群組名：P1: AA-1（直接對應 mold 欄，最省事）\n"
              "• 按檔案分組：先用 # 檔案名稱 指定檔案，接著定義該檔案的分組規則\n"
              "• 當多檔案有相同標籤時，請使用按檔案分組格式避免誤判\n"
-             "• 使用上方「各檔案獨立配置」可針對不同檔案設定不同的分組方式",
+             "• 想零輸入請改用上方顯示模式的「按模具群組分組」",
         height=200,
     )
 
@@ -1200,8 +1258,10 @@ def _parse_custom_groups(text: str) -> dict:
         name, values = line.split(":", 1)
         group_name = name.strip()
         for token in values.split(","):
-            tag = token.strip()
-            if tag:
+            for tag in _expand_range_token(token):  # 展開 #7-1~#7-10
+                tag = tag.strip()
+                if not tag:
+                    continue
                 if current_file:
                     # File-specific mapping: (filename, tag) -> group
                     mapping[(current_file, tag)] = group_name
@@ -1213,35 +1273,42 @@ def _parse_custom_groups(text: str) -> dict:
 
 
 def _apply_custom_mapping(raw: pd.DataFrame, mapping: dict) -> pd.Series:
-    """Apply custom group mapping considering file-specific rules."""
+    """Apply custom group mapping considering file-specific rules.
+
+    每筆資料的比對鍵優先用 pos_tag（如 #7-1），對不上時再試 mold 群組名
+    （如 AA-1），因此 `P1: AA-1` 這種以群組名分組的寫法也能運作。
+    """
     result = pd.Series("其他", index=raw.index)
-
-    # Check if mapping has file-specific keys (tuples)
     has_file_keys = any(isinstance(k, tuple) for k in mapping.keys())
+    has_mold = "mold" in raw.columns
 
-    if has_file_keys:
-        # File-specific mapping
-        for idx, row in raw.iterrows():
-            file_name = row.get("file", "")
-            tag = row.get("pos_tag", "")
-            if pd.isna(tag):
-                tag = ""
+    def _candidates(row):
+        """依序回傳可用來比對的鍵：pos_tag → mold。"""
+        keys = []
+        for col in ("pos_tag", "mold") if has_mold else ("pos_tag",):
+            val = row.get(col, "")
+            if pd.notna(val) and str(val).strip():
+                keys.append(str(val).strip())
+        return keys
 
-            # Try file-specific key first
-            key = (file_name, str(tag))
+    for idx, row in raw.iterrows():
+        file_name = row.get("file", "")
+        for key in _candidates(row):
+            if has_file_keys and (file_name, key) in mapping:
+                result.loc[idx] = mapping[(file_name, key)]
+                break
             if key in mapping:
                 result.loc[idx] = mapping[key]
-            # Fall back to global key
-            elif str(tag) in mapping:
-                result.loc[idx] = mapping[str(tag)]
-    else:
-        # Simple global mapping
-        result = raw["pos_tag"].map(mapping).fillna("其他")
+                break
 
     return result
 
 
-if use_custom_grouping:
+if mode == MODE_BY_MOLD:
+    # 零輸入：直接依模具群組欄（AA-1/AA-2）分組
+    mold_series = raw["mold"].fillna("").astype(str).str.strip()
+    raw["group"] = mold_series.replace("", "未分組")
+elif use_custom_grouping:
     if "pos_tag" in raw.columns and raw["pos_tag"].notna().any():
         mapping = _parse_custom_groups(custom_groups)
         mapped = _apply_custom_mapping(raw, mapping)
@@ -1312,6 +1379,8 @@ with st.expander("📋 查看分組詳情", expanded=False):
         # Display mode info
         if mode == "全部合併成一張圖":
             st.info("模式：全部合併成一張圖（所有數據合併顯示）")
+        elif mode == MODE_BY_MOLD:
+            st.info(f"模式：{MODE_BY_MOLD}（直接依模具群組欄分組）")
         elif mode == "強制分檔顯示":
             st.info("模式：強制分檔顯示（按檔案 + 位置分組）")
         else:
