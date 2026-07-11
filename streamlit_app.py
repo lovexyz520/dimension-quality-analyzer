@@ -1000,6 +1000,45 @@ mode = st.radio(
           if _mold_groupable else None),
 )
 
+# 分組方式說明面板：用實際載入的資料舉例，讓使用者知道有哪些做法
+with st.expander("💡 怎麼把資料分組？（4 種方式，挑最順手的）", expanded=False):
+    # 從資料抓真實的模具群組名與標籤來當範例，說明更貼近使用者的檔案
+    _mold_egs = []
+    if "mold" in raw.columns:
+        _mold_egs = sorted(
+            {str(m).strip() for m in raw["mold"].dropna() if str(m).strip()},
+            key=_natural_key,
+        )
+    _tag_egs = []
+    if "pos_tag" in raw.columns:
+        _tag_egs = sorted(
+            {str(t).strip() for t in raw["pos_tag"].dropna() if str(t).strip()},
+            key=_natural_key,
+        )
+
+    g1 = _mold_egs[0] if _mold_egs else "AA-1"
+    g2 = _mold_egs[1] if len(_mold_egs) > 1 else "AA-2"
+    t_first = _tag_egs[0] if _tag_egs else "#7-1"
+    t_mid = _tag_egs[len(_tag_egs) // 2] if len(_tag_egs) > 1 else "#7-11"
+    t_last = _tag_egs[-1] if _tag_egs else "#7-20"
+
+    if _mold_egs:
+        st.caption(f"這批資料的模具群組：{'、'.join(_mold_egs[:8])}"
+                   + ("…" if len(_mold_egs) > 8 else ""))
+
+    st.markdown(
+        f"""
+| 方式 | 怎麼做 |
+|------|--------|
+| **① 零輸入（最推薦）** | 上方顯示模式選「**{MODE_BY_MOLD}**」，什麼都不填，直接依 `{g1}`／`{g2}` 分{'' if _mold_groupable else '（此批資料無模具群組，故未顯示此選項）'} |
+| **② 用群組名** | 勾「使用自訂分組規則」，填 `P1: {g1}` 換行 `P2: {g2}`，兩行搞定 |
+| **③ 範圍寫法** | 自訂分組填 `P1: {t_first}~{t_mid}` 換行 `P2: …~{t_last}`，不用逐一列出 |
+| **④ 快速配置** | 自訂分組內用「快速配置」設穴數／模次數＋穴號或模次優先，會自動產生**這個檔案真正的標籤**規則 |
+"""
+    )
+    st.caption("比對優先序：先看標籤（pos_tag，如 "
+               f"`{t_first}`），對不上再看模具群組（mold，如 `{g1}`）。")
+
 # Custom grouping rules
 use_custom_grouping = st.checkbox("使用自訂分組規則", value=False)
 custom_groups = ""
